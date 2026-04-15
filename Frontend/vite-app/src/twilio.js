@@ -43,13 +43,15 @@ const attachCallDebugHandlers = (call, direction) => {
   });
 };
 
+const BACKEND = import.meta.env.VITE_API_BASE_URL || "http://localhost:5000";
+
 export const initDevice = async (identity) => {
   if (!identity?.trim()) {
     console.error("Please enter a valid identity");
     return;
   }
 
-  const res = await fetch(`http://localhost:5000/token?identity=${identity}`);
+  const res = await fetch(`${BACKEND}/token?identity=${identity}`);
 
   if (!res.ok) {
     console.error("Failed to fetch token");
