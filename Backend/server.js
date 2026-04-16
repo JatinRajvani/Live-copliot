@@ -92,6 +92,14 @@ const SILENCE_DEBOUNCE_MS   = 600;   // flush 600 ms after last speech packet
 const MAX_UTTERANCE_MS      = 14000; // safety: force-flush after 14 s of speech
 const MIN_FLUSH_BYTES       = 3200;  // ~400 ms of 8-kHz audio — skip shorter clips
 
+const agentIdentities = (process.env.AGENT_IDENTITIES || "")
+  .split(",")
+  .map((identity) => identity.trim().toLowerCase())
+  .filter(Boolean);
+
+const callRoleProfiles = new Map(); // callSid -> { initiatorRole, from, to, direction }
+const streamToCallSid = new Map();  // streamSid -> callSid
+
 // Inline µ-law → PCM decoder (avoids importing from transcription service)
 function decodeMuLawByte(b) {
   const BIAS = 0x84;
@@ -112,6 +120,50 @@ function muLawPayloadRMS(base64Payload) {
     sumSq += s * s;
   }
   return Math.sqrt(sumSq / buf.length);
+}
+
+function parseClientIdentity(rawEndpoint) {
+  const endpoint = rawEndpoint?.toString().trim() || "";
+  if (!endpoint) return "";
+  return endpoint.startsWith("client:") ? endpoint.slice(7) : endpoint;
+}
+
+function inferInitiatorRole({ from, to, direction }) {
+  const normalizedDirection = (direction || "").toLowerCase();
+  const fromIdentity = parseClientIdentity(from).toLowerCase();
+  const toIdentity = parseClientIdentity(to).toLowerCase();
+
+  if (fromIdentity && agentIdentities.includes(fromIdentity)) {
+    return "agent";
+  }
+
+  if (toIdentity && agentIdentities.includes(toIdentity)) {
+    return "customer";
+  }
+
+  if (normalizedDirection.startsWith("outbound")) {
+    return "agent";
+  }
+
+  if (normalizedDirection.startsWith("inbound")) {
+    return "customer";
+  }
+
+  return "unknown";
+}
+
+function resolveSpeakerForTrack(callSid, track) {
+  const profile = callSid ? callRoleProfiles.get(callSid) : null;
+  const normalizedTrack = track === "outbound" ? "outbound" : "inbound";
+
+  if (!profile || profile.initiatorRole === "unknown") {
+    // Backward-compatible fallback: outbound sales model.
+    return normalizedTrack === "inbound" ? "agent" : "customer";
+  }
+
+  const initiatorSpeaker = profile.initiatorRole;
+  const receiverSpeaker = initiatorSpeaker === "agent" ? "customer" : "agent";
+  return normalizedTrack === "inbound" ? initiatorSpeaker : receiverSpeaker;
 }
 
 const streamStates = new Map();
@@ -243,9 +295,18 @@ app.get("/token", (req, res) => {
 // 📞 CALL HANDLER (TwiML)
 app.post("/voice", (req, res) => {
   const to = req.body.To?.toString().trim();
+  const callSid = req.body.CallSid?.toString().trim() || "";
+  const from = req.body.From?.toString().trim() || "";
+  const direction = req.body.Direction?.toString().trim() || "";
 
   if (!to) {
     return res.status(400).send("Missing 'To' parameter");
+  }
+
+  if (callSid) {
+    const initiatorRole = inferInitiatorRole({ from, to, direction });
+    callRoleProfiles.set(callSid, { initiatorRole, from, to, direction });
+    console.log("Call role profiled", { callSid, initiatorRole, from, to, direction });
   }
 
   const VoiceResponse = twilio.twiml.VoiceResponse;
@@ -297,14 +358,28 @@ wss.on("connection", (socket, request) => {
       }
       case "start": {
         streamSid = message.start?.streamSid || message.streamSid || null;
+        const callSid = message.start?.callSid || null;
+        if (streamSid && callSid) {
+          streamToCallSid.set(streamSid, callSid);
+        }
+
+        const mappedCallSid = callSid || (streamSid ? streamToCallSid.get(streamSid) : null);
         if (streamSid) {
           // Pre-create both track states so VAD is ready before any packets arrive
-          getOrCreateStreamState(`${streamSid}-inbound`,  streamSid, "customer");
-          getOrCreateStreamState(`${streamSid}-outbound`, streamSid, "agent");
+          getOrCreateStreamState(
+            `${streamSid}-inbound`,
+            streamSid,
+            resolveSpeakerForTrack(mappedCallSid, "inbound")
+          );
+          getOrCreateStreamState(
+            `${streamSid}-outbound`,
+            streamSid,
+            resolveSpeakerForTrack(mappedCallSid, "outbound")
+          );
         }
         console.log("Media stream started", {
           streamSid,
-          callSid: message.start?.callSid || null,
+          callSid,
         });
         break;
       }
@@ -319,18 +394,17 @@ wss.on("connection", (socket, request) => {
         // Key = "<streamSid>-<track>" → "MZ123-inbound" / "MZ123-outbound"
         const trackKey = `${rawSid}-${track}`;
 
-        // Twilio "inbound"  = audio arriving FROM the call initiator = the AGENT (sales rep who placed the call)
-        // Twilio "outbound" = audio arriving FROM the called party   = the CUSTOMER
-        // NOTE: this assumes the agent always initiates the call (outbound sales call model).
-        const speaker  = track === "inbound" ? "agent" : "customer";
+        const mappedCallSid = rawSid ? streamToCallSid.get(rawSid) : null;
+        const speaker = resolveSpeakerForTrack(mappedCallSid, track);
 
         if (mediaPacketCount === 1) {
-          console.log(`🔍 First packet — track: "${track}" → key: ${trackKey}`);
+          console.log(`🔍 First packet — track: "${track}" → key: ${trackKey} → speaker: ${speaker}`);
         }
 
         if (!rawSid || !payload) break;
 
         const state = getOrCreateStreamState(trackKey, rawSid, speaker);
+        state.speaker = speaker;
 
         // VAD: compute RMS on this packet
         const rms = muLawPayloadRMS(payload);
@@ -368,6 +442,12 @@ wss.on("connection", (socket, request) => {
       case "stop": {
         const rawSid = message.streamSid || streamSid;
         if (rawSid) {
+          const mappedCallSid = streamToCallSid.get(rawSid);
+          if (mappedCallSid) {
+            streamToCallSid.delete(rawSid);
+            callRoleProfiles.delete(mappedCallSid);
+          }
+
           flushAllTracks(rawSid);
           setTimeout(() => {
             cleanupStreamState(`${rawSid}-inbound`);
@@ -388,6 +468,11 @@ wss.on("connection", (socket, request) => {
 
   socket.on("close", () => {
     if (streamSid) {
+      const mappedCallSid = streamToCallSid.get(streamSid);
+      if (mappedCallSid) {
+        streamToCallSid.delete(streamSid);
+        callRoleProfiles.delete(mappedCallSid);
+      }
       flushAllTracks(streamSid);
     }
     console.log("Twilio media WebSocket disconnected", { streamSid, mediaPacketCount });
