@@ -9,8 +9,37 @@ import { transcribeTwilioMuLawChunk } from "./modules/copilot/transcription.serv
 
 dotenv.config();
 
+const rawAllowedOrigins = process.env.ALLOWED_ORIGINS || "http://localhost:5173";
+
+if (!process.env.ALLOWED_ORIGINS) {
+  console.warn("ALLOWED_ORIGINS is not set. Falling back to http://localhost:5173");
+}
+
+const allowedOrigins = rawAllowedOrigins
+  .split(",")
+  .map((origin) => origin.trim().replace(/\/$/, ""))
+  .filter(Boolean);
+
+function normalizeOrigin(origin) {
+  return origin.replace(/\/$/, "");
+}
+
+function isAllowedOrigin(origin) {
+  return !!origin && allowedOrigins.includes(normalizeOrigin(origin));
+}
+
 const app = express();
-app.use(cors());
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (!origin || isAllowedOrigin(origin)) {
+        return callback(null, true);
+      }
+      return callback(new Error("Origin not allowed"));
+    },
+    methods: ["GET", "POST"],
+  })
+);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -19,8 +48,15 @@ const server = http.createServer(app);
 // 🔌 Socket.IO for Real-Time Transcript Streaming
 const io = new SocketIOServer(server, {
   cors: {
-    origin: ["http://localhost:5173"],
+    origin: allowedOrigins,
     methods: ["GET", "POST"],
+  },
+  allowRequest: (req, callback) => {
+    const origin = req.headers.origin;
+    if (!origin || isAllowedOrigin(origin)) {
+      return callback(null, true);
+    }
+    return callback("Origin not allowed", false);
   },
 });
 
