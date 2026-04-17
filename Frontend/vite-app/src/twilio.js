@@ -94,20 +94,65 @@ const attachCallDebugHandlers = (call, direction) => {
 
 const BACKEND = import.meta.env.VITE_API_BASE_URL || "http://localhost:5000";
 
-export const initDevice = async (identity) => {
-  if (!identity?.trim()) {
-    console.error("Please enter a valid identity");
-    return;
+function getAuthToken() {
+  const storageKeys = [
+    "authToken",
+    "aisiAuthToken",
+    "token",
+    "jwt",
+    "accessToken",
+    import.meta.env.VITE_AUTH_TOKEN_STORAGE_KEY,
+  ].filter(Boolean);
+
+  for (const key of storageKeys) {
+    try {
+      const value = window.localStorage.getItem(key);
+      if (value?.trim()) {
+        return value.trim();
+      }
+    } catch (error) {
+      console.warn("Unable to read auth token from localStorage", error);
+      break;
+    }
   }
 
-  const res = await fetch(`${BACKEND}/token?identity=${encodeURIComponent(identity)}`);
+  return "";
+}
+
+export const initDevice = async (identity) => {
+  const authToken = getAuthToken();
+  if (!authToken) {
+    console.error("Missing auth token. Please login first.");
+    return { ok: false, error: "missing-auth-token" };
+  }
+
+  const query = identity?.trim()
+    ? `?identity=${encodeURIComponent(identity.trim().toLowerCase())}`
+    : "";
+  const res = await fetch(`${BACKEND}/token${query}`, {
+    headers: {
+      Authorization: `Bearer ${authToken}`,
+    },
+  });
 
   if (!res.ok) {
-    console.error("Failed to fetch token");
-    return false;
+    let payload;
+    try {
+      payload = await res.json();
+    } catch {
+      payload = null;
+    }
+    console.error("Failed to fetch token", payload?.error || res.statusText);
+    return { ok: false, error: payload?.error || "token-fetch-failed" };
   }
 
   const data = await res.json();
+  const resolvedIdentity = data?.identity?.toString().trim().toLowerCase();
+
+  if (!resolvedIdentity) {
+    console.error("Token API did not return resolved identity");
+    return { ok: false, error: "missing-identity" };
+  }
 
   if (device) {
     await destroyTwilio();
@@ -117,7 +162,7 @@ export const initDevice = async (identity) => {
 
   device.on("registered", () => {
     console.log("Device registered");
-    emit("device:registered", { identity });
+    emit("device:registered", { identity: resolvedIdentity });
   });
 
   device.on("incoming", (call) => {
@@ -138,7 +183,7 @@ export const initDevice = async (identity) => {
   });
 
   await device.register();
-  return true;
+  return { ok: true, identity: resolvedIdentity };
 };
 
 

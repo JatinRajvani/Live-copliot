@@ -2,12 +2,14 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import twilio from "twilio";
+import jwt from "jsonwebtoken";
 import http from "http";
 import { WebSocketServer } from "ws";
 import { Server as SocketIOServer } from "socket.io";
 import { transcribeTwilioMuLawChunk } from "./modules/copilot/transcription.service.js";
 import { generateRealtimeHint } from "./modules/copilot/hint.service.js";
 import { generateSessionSummary } from "./modules/copilot/summary.service.js";
+import { getUserFromTokenClaims, loginUser, registerUser } from "./modules/auth/auth.service.js";
 
 dotenv.config();
 
@@ -39,6 +41,7 @@ app.use(
       }
       return callback(new Error("Origin not allowed"));
     },
+    credentials: true,
     methods: ["GET", "POST"],
   })
 );
@@ -46,6 +49,106 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 const server = http.createServer(app);
+
+function getRequestProtocol(req) {
+  const forwardedProto = req.headers["x-forwarded-proto"]?.toString().split(",")[0]?.trim();
+  return forwardedProto || req.protocol || "http";
+}
+
+function buildExternalRequestUrl(req) {
+  const protocol = getRequestProtocol(req);
+  const host = req.get("host");
+  return `${protocol}://${host}${req.originalUrl}`;
+}
+
+function toUrlEncodedFormBody(body) {
+  const params = new URLSearchParams();
+
+  if (!body || typeof body !== "object") {
+    return params;
+  }
+
+  for (const [key, value] of Object.entries(body)) {
+    if (value === undefined || value === null) {
+      continue;
+    }
+    params.append(key, value.toString());
+  }
+
+  return params;
+}
+
+function verifyTwilioWebhookRequest(req) {
+  const twilioAuthToken = process.env.TWILIO_AUTH_TOKEN?.toString().trim();
+  if (!twilioAuthToken) {
+    console.error("TWILIO_AUTH_TOKEN is required for webhook signature validation");
+    return false;
+  }
+
+  const signature = req.headers["x-twilio-signature"]?.toString().trim() || "";
+  if (!signature) {
+    return false;
+  }
+
+  const webhookUrl = buildExternalRequestUrl(req);
+  const formParams = Object.fromEntries(toUrlEncodedFormBody(req.body));
+
+  return twilio.validateRequest(twilioAuthToken, signature, webhookUrl, formParams);
+}
+
+function getMediaStreamSecretFromUrl(rawUrl) {
+  const parsedUrl = new URL(rawUrl || "/", "http://localhost");
+  return parsedUrl.searchParams.get("secret")?.toString().trim() || "";
+}
+
+function normalizeMediaStreamSecret(secret) {
+  return secret?.toString().trim().replace(/ /g, "+") || "";
+}
+
+function extractMediaStreamSecretFromStartPayload(startPayload) {
+  const customParameters = startPayload?.customParameters || {};
+  const candidate =
+    customParameters.secret ||
+    customParameters.SECRET ||
+    customParameters.streamSecret ||
+    customParameters.streamsecret;
+
+  return normalizeMediaStreamSecret(candidate);
+}
+
+function isAllowedMediaEvent(message) {
+  return ["connected", "start", "media", "stop"].includes(message?.event);
+}
+
+function isValidMediaMessage(message) {
+  if (!message || typeof message !== "object" || !isAllowedMediaEvent(message)) {
+    return false;
+  }
+
+  switch (message.event) {
+    case "connected":
+      return true;
+    case "start":
+      return !!(message.start?.streamSid || message.streamSid);
+    case "media": {
+      const streamSid = message.streamSid;
+      const payload = message.media?.payload;
+      const track = message.media?.track;
+      const isTrackValid = !track || ["inbound", "outbound"].includes(track);
+
+      if (!streamSid || !payload || !isTrackValid) {
+        return false;
+      }
+
+      const isBase64Payload = /^[A-Za-z0-9+/=]+$/.test(payload);
+      return isBase64Payload;
+    }
+    case "stop":
+      return !!(message.streamSid || message.stop?.streamSid);
+    default:
+      return false;
+  }
+}
 
 // 🔌 Socket.IO for Real-Time Transcript Streaming
 const io = new SocketIOServer(server, {
@@ -95,10 +198,12 @@ io.on("connection", (socket) => {
 const wss = new WebSocketServer({ noServer: true });
 
 server.on("upgrade", (request, socket, head) => {
-  if (request.url.startsWith("/media-stream")) {
+  const parsedUrl = new URL(request.url || "/", "http://localhost");
+  if (parsedUrl.pathname === "/media-stream") {
     wss.handleUpgrade(request, socket, head, (ws) => {
       wss.emit("connection", ws, request);
     });
+    return;
   }
   // Other paths (like /socket.io/) are ignored by ws and picked up by Socket.IO
 });
@@ -401,6 +506,108 @@ function flushAllTracks(streamSid) {
 
 const AccessToken = twilio.jwt.AccessToken;
 const VoiceGrant = AccessToken.VoiceGrant;
+const tokenRateLimitStore = new Map();
+
+const TOKEN_RATE_LIMIT_WINDOW_MS = Number(process.env.TOKEN_RATE_LIMIT_WINDOW_MS || 10 * 60 * 1000);
+const TOKEN_RATE_LIMIT_MAX = Number(process.env.TOKEN_RATE_LIMIT_MAX || 30);
+
+function sanitizeIdentity(rawIdentity) {
+  const candidate = rawIdentity?.toString().trim().toLowerCase() || "";
+  if (!candidate) {
+    return "";
+  }
+
+  return candidate.replace(/[^a-z0-9_.@-]/g, "").slice(0, 120);
+}
+
+function extractBearerToken(authHeader) {
+  const value = authHeader?.toString().trim() || "";
+  if (!value.toLowerCase().startsWith("bearer ")) {
+    return "";
+  }
+  return value.slice(7).trim();
+}
+
+function extractTokenFromRequest(req) {
+  return extractBearerToken(req.headers.authorization);
+}
+
+function extractIdentityFromClaims(claims) {
+  const candidate =
+    claims?.twilio_identity ||
+    claims?.identity ||
+    claims?.preferred_username ||
+    claims?.email ||
+    claims?.sub;
+
+  return sanitizeIdentity(candidate);
+}
+
+function getRequesterIp(req) {
+  const forwardedFor = req.headers["x-forwarded-for"]?.toString().split(",")[0]?.trim();
+  return forwardedFor || req.ip || req.socket?.remoteAddress || "unknown";
+}
+
+function enforceTokenRateLimit(req, res, next) {
+  const now = Date.now();
+  const ip = getRequesterIp(req);
+  const authSubject = req.authClaims?.sub || req.authClaims?.email || "anonymous";
+  const key = `${ip}:${authSubject}`;
+
+  const current = tokenRateLimitStore.get(key);
+  if (!current || now - current.windowStart >= TOKEN_RATE_LIMIT_WINDOW_MS) {
+    tokenRateLimitStore.set(key, { windowStart: now, count: 1 });
+    return next();
+  }
+
+  current.count += 1;
+  if (current.count > TOKEN_RATE_LIMIT_MAX) {
+    return res.status(429).json({
+      error: "Too many token requests. Please retry later.",
+      retryAfterMs: Math.max(0, current.windowStart + TOKEN_RATE_LIMIT_WINDOW_MS - now),
+    });
+  }
+
+  return next();
+}
+
+async function requireTokenAuth(req, res, next) {
+  const secret = process.env.JWT_SECRET?.toString().trim();
+  if (!secret) {
+    return res.status(500).json({ error: "JWT server secret is not configured" });
+  }
+
+  const bearerToken = extractTokenFromRequest(req);
+  if (!bearerToken) {
+    return res.status(401).json({ error: "Missing bearer token" });
+  }
+
+  try {
+    const claims = jwt.verify(bearerToken, secret, {
+      algorithms: ["HS256"],
+    });
+
+    const authenticatedUser = await getUserFromTokenClaims(claims);
+    if (!authenticatedUser) {
+      return res.status(401).json({ error: "Authenticated user not found or inactive" });
+    }
+
+    req.authClaims = claims;
+    req.authUser = authenticatedUser;
+    return next();
+  } catch (error) {
+    return res.status(401).json({ error: "Invalid or expired token" });
+  }
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, value] of tokenRateLimitStore.entries()) {
+    if (now - value.windowStart >= TOKEN_RATE_LIMIT_WINDOW_MS) {
+      tokenRateLimitStore.delete(key);
+    }
+  }
+}, Math.min(TOKEN_RATE_LIMIT_WINDOW_MS, 60 * 1000)).unref();
 
 // 🔑 TOKEN API
 
@@ -408,18 +615,85 @@ app.get('/health',(req, res) => {
   res.send('API is healthy');
 });
 
-app.get("/token", (req, res) => {
-  const identity = req.query.identity?.toString().trim();
+app.post("/auth/signup", async (req, res) => {
+  try {
+    const result = await registerUser({
+      name: req.body?.name,
+      email: req.body?.email,
+      password: req.body?.password,
+      identity: req.body?.identity,
+    });
 
-  if (!identity) {
-    return res.status(400).json({ error: "identity query param is required" });
+    if (!result.ok) {
+      return res.status(result.status).json({ error: result.error });
+    }
+
+    return res.status(result.status).json({
+      token: result.token,
+      user: result.user,
+    });
+  } catch (error) {
+    console.error("Signup failed", error?.message || error);
+    return res.status(500).json({ error: "Signup failed" });
+  }
+});
+
+app.post("/auth/login", async (req, res) => {
+  try {
+    const result = await loginUser({
+      email: req.body?.email,
+      password: req.body?.password,
+    });
+
+    if (!result.ok) {
+      return res.status(result.status).json({ error: result.error });
+    }
+
+    return res.status(result.status).json({
+      token: result.token,
+      user: result.user,
+    });
+  } catch (error) {
+    console.error("Login failed", error?.message || error);
+    return res.status(500).json({ error: "Login failed" });
+  }
+});
+
+app.get("/auth/me", requireTokenAuth, (req, res) => {
+  return res.json({ user: req.authUser });
+});
+
+app.post("/auth/logout", (_req, res) => {
+  return res.status(204).send();
+});
+
+app.get("/token", requireTokenAuth, enforceTokenRateLimit, (req, res) => {
+  const identityFromToken = extractIdentityFromClaims(req.authClaims);
+  if (!identityFromToken) {
+    return res.status(403).json({ error: "No valid identity claim found in auth token" });
+  }
+
+  const requestedIdentity = sanitizeIdentity(req.query.identity);
+  if (requestedIdentity && requestedIdentity !== identityFromToken) {
+    return res.status(403).json({
+      error: "Requested identity does not match authenticated identity",
+    });
+  }
+
+  if (
+    !process.env.TWILIO_ACCOUNT_SID ||
+    !process.env.TWILIO_API_KEY ||
+    !process.env.TWILIO_API_SECRET ||
+    !process.env.TWILIO_TWIML_APP_SID
+  ) {
+    return res.status(500).json({ error: "Twilio credentials are not fully configured" });
   }
 
   const token = new AccessToken(
     process.env.TWILIO_ACCOUNT_SID,
     process.env.TWILIO_API_KEY,
     process.env.TWILIO_API_SECRET,
-    { identity }
+    { identity: identityFromToken }
   );
 
   const voiceGrant = new VoiceGrant({
@@ -429,11 +703,15 @@ app.get("/token", (req, res) => {
 
   token.addGrant(voiceGrant);
 
-  res.json({ token: token.toJwt() });
+  res.json({ token: token.toJwt(), identity: identityFromToken });
 });
 
 // 📞 CALL HANDLER (TwiML)
 app.post("/voice", (req, res) => {
+  if (!verifyTwilioWebhookRequest(req)) {
+    return res.status(403).send("Invalid Twilio signature");
+  }
+
   const to = req.body.To?.toString().trim();
   const callSid = req.body.CallSid?.toString().trim() || "";
   const from = req.body.From?.toString().trim() || "";
@@ -452,14 +730,28 @@ app.post("/voice", (req, res) => {
   const VoiceResponse = twilio.twiml.VoiceResponse;
   const response = new VoiceResponse();
 
-  const mediaStreamUrl = process.env.TWILIO_MEDIA_STREAM_URL?.toString().trim();
+  const baseMediaStreamUrl = process.env.TWILIO_MEDIA_STREAM_URL?.toString().trim();
+  const mediaStreamSecret = normalizeMediaStreamSecret(process.env.TWILIO_MEDIA_STREAM_SECRET);
+  const mediaStreamUrl = baseMediaStreamUrl;
+
+  if (!mediaStreamUrl || !mediaStreamSecret) {
+    console.warn("Media stream URL or secret missing; live transcript streaming is disabled for this call");
+  }
+
   if (mediaStreamUrl) {
     // Start streaming call audio to backend while preserving the existing dial flow.
     const start = response.start();
-    start.stream({
+    const stream = start.stream({
       url: mediaStreamUrl,
       track: "both_tracks",
     });
+
+    if (mediaStreamSecret) {
+      stream.parameter({
+        name: "secret",
+        value: mediaStreamSecret,
+      });
+    }
   }
 
   const dial = response.dial();
@@ -488,6 +780,15 @@ wss.on("connection", (socket, request) => {
       return;
     }
 
+    if (!isValidMediaMessage(message)) {
+      console.warn("Rejecting invalid Twilio media message", {
+        event: message?.event,
+        streamSid,
+      });
+      socket.close(1008, "Invalid media message");
+      return;
+    }
+
     switch (message.event) {
       case "connected": {
         console.log("Media stream transport connected", {
@@ -497,6 +798,19 @@ wss.on("connection", (socket, request) => {
         break;
       }
       case "start": {
+        const expectedSecret = normalizeMediaStreamSecret(process.env.TWILIO_MEDIA_STREAM_SECRET);
+        const providedSecret = extractMediaStreamSecretFromStartPayload(message.start);
+
+        if (!expectedSecret || providedSecret !== expectedSecret) {
+          console.warn("Rejected media stream start due to invalid secret", {
+            streamSid,
+            hasExpectedSecret: !!expectedSecret,
+            providedSecretLength: providedSecret.length,
+          });
+          socket.close(1008, "Invalid stream secret");
+          return;
+        }
+
         streamSid = message.start?.streamSid || message.streamSid || null;
         const callSid = message.start?.callSid || null;
         if (streamSid && callSid) {

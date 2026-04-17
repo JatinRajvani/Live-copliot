@@ -1,0 +1,4 @@
+{"name":"jay","email":"jay@gmail.com","identity":"jay","passwordHash":"$2a$10$/EVg4spG65RhwufzKE1JNOGdNPeXrT6W2scCTi9cfyy0KF4SeKlFC","role":"user","isActive":true,"_id":"WBcqqGkM5UEGAYWJ","createdAt":{"$$date":1776422255077},"updatedAt":{"$$date":1776422255077}}
+{"name":"raj","email":"raj@gmail.com","identity":"raj","passwordHash":"$2a$10$H4NXf11XA/9cqBIpDG9/DOcIHzyvyrqLI6Cv11jufp9IE557kB.G.","role":"user","isActive":true,"_id":"wo122aJSBSrocneP","createdAt":{"$$date":1776422339706},"updatedAt":{"$$date":1776422339706}}
+{"$$indexCreated":{"fieldName":"email","unique":true,"sparse":false}}
+{"$$indexCreated":{"fieldName":"identity","unique":true,"sparse":false}}

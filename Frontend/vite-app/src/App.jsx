@@ -9,8 +9,17 @@ import {
 } from "./twilio";
 
 const BACKEND = import.meta.env.VITE_API_BASE_URL;
+const AUTH_STORAGE_KEY = "aisiAuthToken";
 
 function App() {
+  // ── Auth state ────────────────────────────────────────────────────────────
+  const [authMode, setAuthMode] = useState("login"); // login | signup
+  const [authForm, setAuthForm] = useState({ name: "", email: "", password: "" });
+  const [authUser, setAuthUser] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authError, setAuthError] = useState("");
+
   // ── Call state ────────────────────────────────────────────────────────────
   const [identity, setIdentity]       = useState("");
   const [callTo, setCallTo]           = useState("");
@@ -30,6 +39,70 @@ function App() {
   useEffect(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [transcripts]);
+
+  function readAuthToken() {
+    try {
+      return window.localStorage.getItem(AUTH_STORAGE_KEY)?.trim() || "";
+    } catch {
+      return "";
+    }
+  }
+
+  function persistAuthToken(token) {
+    try {
+      window.localStorage.setItem(AUTH_STORAGE_KEY, token);
+      window.localStorage.setItem("authToken", token);
+    } catch (error) {
+      console.error("Unable to save auth token", error);
+    }
+  }
+
+  function clearAuthToken() {
+    try {
+      window.localStorage.removeItem(AUTH_STORAGE_KEY);
+      window.localStorage.removeItem("authToken");
+    } catch (error) {
+      console.error("Unable to clear auth token", error);
+    }
+  }
+
+  async function fetchAuthMe(token) {
+    const response = await fetch(`${BACKEND}/auth/me`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    });
+
+    if (!response.ok) {
+      return { ok: false };
+    }
+
+    const payload = await response.json();
+    return { ok: true, user: payload.user };
+  }
+
+  useEffect(() => {
+    async function bootstrapAuth() {
+      const token = readAuthToken();
+      if (!token) {
+        setAuthLoading(false);
+        return;
+      }
+
+      const result = await fetchAuthMe(token);
+      if (!result.ok || !result.user) {
+        clearAuthToken();
+        setAuthLoading(false);
+        return;
+      }
+
+      setAuthUser(result.user);
+      setIdentity(result.user.identity || "");
+      setAuthLoading(false);
+    }
+
+    void bootstrapAuth();
+  }, []);
 
   // Socket.IO connection
   useEffect(() => {
@@ -145,14 +218,108 @@ function App() {
     };
   }, []);
 
+  async function submitAuth(endpoint) {
+    setAuthBusy(true);
+    setAuthError("");
+
+    try {
+      const payload =
+        endpoint === "signup"
+          ? {
+              name: authForm.name,
+              email: authForm.email,
+              password: authForm.password,
+            }
+          : {
+              email: authForm.email,
+              password: authForm.password,
+            };
+
+      const response = await fetch(`${BACKEND}/auth/${endpoint}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      });
+
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        setAuthError(body?.error || "Authentication failed");
+        return;
+      }
+
+      if (!body?.token || !body?.user) {
+        setAuthError("Invalid auth response from server");
+        return;
+      }
+
+      persistAuthToken(body.token);
+      setAuthUser(body.user);
+      setIdentity(body.user.identity || "");
+      setAuthForm((prev) => ({ ...prev, password: "" }));
+      setAuthMode("login");
+    } catch (error) {
+      setAuthError("Unable to reach auth server");
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  async function handleSignup(e) {
+    e.preventDefault();
+    if (!authForm.name.trim()) {
+      setAuthError("Name is required");
+      return;
+    }
+    if (!authForm.email.trim()) {
+      setAuthError("Email is required");
+      return;
+    }
+    if (authForm.password.length < 8) {
+      setAuthError("Password must be at least 8 characters");
+      return;
+    }
+    await submitAuth("signup");
+  }
+
+  async function handleLogin(e) {
+    e.preventDefault();
+    if (!authForm.email.trim() || !authForm.password) {
+      setAuthError("Email and password are required");
+      return;
+    }
+    await submitAuth("login");
+  }
+
+  async function handleLogout() {
+    clearAuthToken();
+    setAuthUser(null);
+    setIdentity("");
+    setDeviceReady(false);
+    setCallStatus("idle");
+    setTranscripts([]);
+    setHints([]);
+    setSessionSummary(null);
+    await destroyTwilio();
+  }
+
   // ── Twilio helpers ────────────────────────────────────────────────────────
   async function handleInit() {
-    if (!identity.trim()) return alert("Enter your name first");
+    if (!authUser?.identity) {
+      alert("Please login first");
+      return;
+    }
 
     setDeviceReady(false);
-    const initialized = await initDevice(identity);
-    if (!initialized) {
-      alert("Device initialization failed. Check backend token API.");
+    const result = await initDevice(authUser.identity);
+    if (!result?.ok) {
+      alert("Device initialization failed. Please login again and retry.");
+      return;
+    }
+
+    if (result.identity) {
+      setIdentity(result.identity);
     }
   }
 
@@ -201,6 +368,78 @@ function App() {
         ● Socket.IO: {socketConnected ? "Connected" : "Disconnected"}
       </p>
 
+      <div style={{
+        padding: "14px 16px",
+        marginBottom: "20px",
+        border: "1px solid #e5e7eb",
+        borderRadius: "8px",
+        backgroundColor: "#f9fafb",
+      }}>
+        <h3 style={{ marginTop: 0, marginBottom: "10px" }}>Account Access</h3>
+
+        {authLoading ? (
+          <p style={{ margin: 0, color: "#6b7280", fontSize: "13px" }}>Checking active session...</p>
+        ) : authUser ? (
+          <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
+            <span style={{ fontSize: "13px", color: "#111827" }}>
+              Signed in as <strong>{authUser.name}</strong> ({authUser.email})
+            </span>
+            <span style={{ fontSize: "12px", color: "#4b5563" }}>Identity: {authUser.identity}</span>
+            <button
+              onClick={handleLogout}
+              style={{ ...btnStyle, backgroundColor: "#111827", color: "#fff", padding: "6px 12px" }}
+            >
+              Logout
+            </button>
+          </div>
+        ) : (
+          <form onSubmit={authMode === "signup" ? handleSignup : handleLogin} style={{ display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center" }}>
+            {authMode === "signup" && (
+              <input
+                placeholder="Full name"
+                value={authForm.name}
+                onChange={(e) => setAuthForm((prev) => ({ ...prev, name: e.target.value }))}
+                style={inputStyle}
+              />
+            )}
+            <input
+              placeholder="Email"
+              type="email"
+              value={authForm.email}
+              onChange={(e) => setAuthForm((prev) => ({ ...prev, email: e.target.value }))}
+              style={inputStyle}
+            />
+            <input
+              placeholder="Password"
+              type="password"
+              value={authForm.password}
+              onChange={(e) => setAuthForm((prev) => ({ ...prev, password: e.target.value }))}
+              style={inputStyle}
+            />
+            <button
+              type="submit"
+              disabled={authBusy}
+              style={{ ...btnStyle, backgroundColor: "#2563eb", color: "#fff" }}
+            >
+              {authBusy ? "Please wait..." : authMode === "signup" ? "Create account" : "Login"}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setAuthError("");
+                setAuthMode((prev) => (prev === "signup" ? "login" : "signup"));
+              }}
+              style={{ ...btnStyle, backgroundColor: "#fff", color: "#111827", border: "1px solid #d1d5db" }}
+            >
+              {authMode === "signup" ? "Have an account? Login" : "New user? Sign up"}
+            </button>
+            {authError && (
+              <div style={{ width: "100%", fontSize: "12px", color: "#dc2626" }}>{authError}</div>
+            )}
+          </form>
+        )}
+      </div>
+
       {/* ── Call Controls ─────────────────────────────────────────────────── */}
       <div style={{
         display: "flex",
@@ -217,16 +456,16 @@ function App() {
         {/* Identity + Init */}
         <input
           id="identity-input"
-          placeholder="Your name"
+          placeholder="Identity"
           value={identity}
           onChange={(e) => setIdentity(e.target.value)}
-          disabled={deviceReady}
+          disabled={true}
           style={inputStyle}
         />
         <button
           id="init-btn"
           onClick={handleInit}
-          disabled={deviceReady}
+          disabled={deviceReady || !authUser}
           style={{ ...btnStyle, backgroundColor: deviceReady ? "#d1fae5" : "#6366f1", color: deviceReady ? "#065f46" : "#fff" }}
         >
           {deviceReady ? "✓ Ready" : "Init"}
