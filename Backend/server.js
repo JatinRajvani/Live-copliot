@@ -504,6 +504,14 @@ function flushAllTracks(streamSid) {
   vadFlush(`${streamSid}-outbound`, "stream-end");
 }
 
+function scheduleSessionSummary(streamSid, reason) {
+  // Give VAD-triggered transcription flushes a short window to complete,
+  // then generate summary from the finalized conversation/hint buffers.
+  setTimeout(() => {
+    void emitSessionSummaryForStream(streamSid, reason);
+  }, 450);
+}
+
 const AccessToken = twilio.jwt.AccessToken;
 const VoiceGrant = AccessToken.VoiceGrant;
 const tokenRateLimitStore = new Map();
@@ -898,8 +906,6 @@ wss.on("connection", (socket, request) => {
       case "stop": {
         const rawSid = message.streamSid || streamSid;
         if (rawSid) {
-          void emitSessionSummaryForStream(rawSid, "stream-stop");
-
           const mappedCallSid = streamToCallSid.get(rawSid);
           if (mappedCallSid) {
             streamToCallSid.delete(rawSid);
@@ -907,10 +913,10 @@ wss.on("connection", (socket, request) => {
           }
 
           flushAllTracks(rawSid);
+          scheduleSessionSummary(rawSid, "stream-stop");
           setTimeout(() => {
             cleanupStreamState(`${rawSid}-inbound`);
             cleanupStreamState(`${rawSid}-outbound`);
-            streamAudienceRooms.delete(rawSid);
           }, 100);
         }
         console.log("Media stream stopped", { streamSid, mediaPacketCount });
@@ -927,15 +933,13 @@ wss.on("connection", (socket, request) => {
 
   socket.on("close", () => {
     if (streamSid) {
-      void emitSessionSummaryForStream(streamSid, "socket-close");
-
       const mappedCallSid = streamToCallSid.get(streamSid);
       if (mappedCallSid) {
         streamToCallSid.delete(streamSid);
         callRoleProfiles.delete(mappedCallSid);
       }
       flushAllTracks(streamSid);
-      streamAudienceRooms.delete(streamSid);
+      scheduleSessionSummary(streamSid, "socket-close");
     }
     console.log("Twilio media WebSocket disconnected", { streamSid, mediaPacketCount });
   });

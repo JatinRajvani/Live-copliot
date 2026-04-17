@@ -2,3 +2,4 @@
 {"name":"raj","email":"raj@gmail.com","identity":"raj","passwordHash":"$2a$10$H4NXf11XA/9cqBIpDG9/DOcIHzyvyrqLI6Cv11jufp9IE557kB.G.","role":"user","isActive":true,"_id":"wo122aJSBSrocneP","createdAt":{"$$date":1776422339706},"updatedAt":{"$$date":1776422339706}}
 {"$$indexCreated":{"fieldName":"email","unique":true,"sparse":false}}
 {"$$indexCreated":{"fieldName":"identity","unique":true,"sparse":false}}
+{"$$indexCreated":{"fieldName":"email","unique":true}}
