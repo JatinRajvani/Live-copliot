@@ -1,6 +1,12 @@
 import { useRef, useState, useEffect } from "react";
 import { io } from "socket.io-client";
-import { Device } from "@twilio/voice-sdk";
+import {
+  destroyTwilio,
+  hangUpActiveCall,
+  initDevice,
+  makeCall,
+  subscribeTwilioEvent,
+} from "./twilio";
 
 const BACKEND = import.meta.env.VITE_API_BASE_URL;
 
@@ -10,8 +16,6 @@ function App() {
   const [callTo, setCallTo]           = useState("");
   const [deviceReady, setDeviceReady] = useState(false);
   const [callStatus, setCallStatus]   = useState("idle"); // idle | calling | in-call
-  const deviceRef   = useRef(null);
-  const activeCall  = useRef(null);
 
   // ── Transcript state ──────────────────────────────────────────────────────
   const [transcripts, setTranscripts]     = useState([]);
@@ -48,57 +52,70 @@ function App() {
     return () => socket.disconnect();
   }, []);
 
+  useEffect(() => {
+    const unsubscribers = [
+      subscribeTwilioEvent("device:registered", () => {
+        setDeviceReady(true);
+      }),
+      subscribeTwilioEvent("device:error", (err) => {
+        console.error("Twilio device error:", err);
+        setCallStatus("idle");
+      }),
+      subscribeTwilioEvent("call:incoming", () => {
+        setCallStatus("in-call");
+      }),
+      subscribeTwilioEvent("call:accepted", () => {
+        setCallStatus("in-call");
+      }),
+      subscribeTwilioEvent("call:disconnected", () => {
+        setCallStatus("idle");
+      }),
+      subscribeTwilioEvent("call:canceled", () => {
+        setCallStatus("idle");
+      }),
+      subscribeTwilioEvent("call:rejected", () => {
+        setCallStatus("idle");
+      }),
+      subscribeTwilioEvent("call:error", (payload) => {
+        console.error("Twilio call error:", payload?.error || payload);
+        setCallStatus("idle");
+      }),
+      subscribeTwilioEvent("device:destroyed", () => {
+        setDeviceReady(false);
+        setCallStatus("idle");
+      }),
+    ];
+
+    return () => {
+      unsubscribers.forEach((unsubscribe) => unsubscribe());
+      void destroyTwilio();
+    };
+  }, []);
+
   // ── Twilio helpers ────────────────────────────────────────────────────────
   async function handleInit() {
     if (!identity.trim()) return alert("Enter your name first");
 
-    const res  = await fetch(`${BACKEND}/token?identity=${encodeURIComponent(identity)}`);
-    const data = await res.json();
-
-    const device = new Device(data.token);
-
-    device.on("registered", () => {
-      console.log("✅ Twilio device registered");
-      setDeviceReady(true);
-    });
-
-    device.on("incoming", (call) => {
-      console.log("📞 Incoming call from", call.parameters.From);
-      activeCall.current = call;
-      setCallStatus("in-call");
-      call.accept();
-
-      call.on("disconnect", () => {
-        activeCall.current = null;
-        setCallStatus("idle");
-      });
-    });
-
-    device.on("error", (err) => console.error("Twilio device error:", err));
-
-    await device.register();
-    deviceRef.current = device;
+    setDeviceReady(false);
+    const initialized = await initDevice(identity);
+    if (!initialized) {
+      alert("Device initialization failed. Check backend token API.");
+    }
   }
 
   async function handleCall() {
-    if (!deviceRef.current) return alert("Init your device first");
+    if (!deviceReady) return alert("Init your device first");
     if (!callTo.trim())     return alert("Enter who to call");
 
     setCallStatus("calling");
-    const call = await deviceRef.current.connect({ params: { To: callTo } });
-    activeCall.current = call;
-
-    call.on("accept",     () => setCallStatus("in-call"));
-    call.on("disconnect", () => { activeCall.current = null; setCallStatus("idle"); });
-    call.on("cancel",     () => { activeCall.current = null; setCallStatus("idle"); });
-    call.on("error",      (err) => { console.error(err); setCallStatus("idle"); });
+    const call = await makeCall(callTo);
+    if (!call) {
+      setCallStatus("idle");
+    }
   }
 
   function handleEndCall() {
-    if (activeCall.current) {
-      activeCall.current.disconnect();
-      activeCall.current = null;
-    }
+    hangUpActiveCall();
     setCallStatus("idle");
   }
 
