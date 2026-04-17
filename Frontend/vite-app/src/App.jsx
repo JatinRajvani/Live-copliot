@@ -24,6 +24,7 @@ function App() {
   const [socketConnected, setSocketConnected] = useState(false);
   const transcriptEndRef = useRef(null);
   const socketRef        = useRef(null);
+  const joinedIdentityRef = useRef(null);
 
   // Auto-scroll
   useEffect(() => {
@@ -68,8 +69,41 @@ function App() {
     });
 
     socketRef.current = socket;
-    return () => socket.disconnect();
+    return () => {
+      if (joinedIdentityRef.current) {
+        socket.emit("leave:identity", { identity: joinedIdentityRef.current });
+      }
+      socket.disconnect();
+    };
   }, []);
+
+  useEffect(() => {
+    const socket = socketRef.current;
+    if (!socket || !socketConnected) {
+      return;
+    }
+
+    const normalizedIdentity = identity.trim().toLowerCase();
+
+    if (!deviceReady || !normalizedIdentity) {
+      if (joinedIdentityRef.current) {
+        socket.emit("leave:identity", { identity: joinedIdentityRef.current });
+        joinedIdentityRef.current = null;
+      }
+      return;
+    }
+
+    if (joinedIdentityRef.current === normalizedIdentity) {
+      return;
+    }
+
+    if (joinedIdentityRef.current) {
+      socket.emit("leave:identity", { identity: joinedIdentityRef.current });
+    }
+
+    socket.emit("join:identity", { identity: normalizedIdentity });
+    joinedIdentityRef.current = normalizedIdentity;
+  }, [socketConnected, deviceReady, identity]);
 
   useEffect(() => {
     const unsubscribers = [

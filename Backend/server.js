@@ -65,6 +65,28 @@ const io = new SocketIOServer(server, {
 io.on("connection", (socket) => {
   console.log("✅ Frontend connected via Socket.IO", socket.id);
 
+  socket.on("join:identity", (payload) => {
+    const identity = payload?.identity?.toString().trim().toLowerCase();
+    if (!identity) {
+      return;
+    }
+
+    const roomName = roomNameForIdentity(identity);
+    socket.join(roomName);
+    console.log("Socket joined identity room", { socketId: socket.id, roomName });
+  });
+
+  socket.on("leave:identity", (payload) => {
+    const identity = payload?.identity?.toString().trim().toLowerCase();
+    if (!identity) {
+      return;
+    }
+
+    const roomName = roomNameForIdentity(identity);
+    socket.leave(roomName);
+    console.log("Socket left identity room", { socketId: socket.id, roomName });
+  });
+
   socket.on("disconnect", () => {
     console.log("❌ Frontend disconnected", socket.id);
   });
@@ -101,8 +123,13 @@ const agentIdentities = (process.env.AGENT_IDENTITIES || "")
 
 const callRoleProfiles = new Map(); // callSid -> { initiatorRole, from, to, direction }
 const streamToCallSid = new Map();  // streamSid -> callSid
+const streamAudienceRooms = new Map(); // streamSid -> [identity room names]
 const copilotSessions = new Map();   // streamSid -> { conversation: [], hints: [] }
 const sessionSummaryLocks = new Set();
+
+function roomNameForIdentity(identity) {
+  return `identity:${identity.toLowerCase().trim()}`;
+}
 
 function getOrCreateCopilotSession(streamSid) {
   if (!copilotSessions.has(streamSid)) {
@@ -128,7 +155,7 @@ async function emitSessionSummaryForStream(streamSid, reason) {
       hints: session.hints,
     });
 
-    io.emit("session:summary", {
+    emitToStreamAudience(streamSid, "session:summary", {
       streamSid,
       reason,
       ...summary,
@@ -140,6 +167,7 @@ async function emitSessionSummaryForStream(streamSid, reason) {
     console.error("Failed to emit session summary", { streamSid, error: error?.message || error });
   } finally {
     copilotSessions.delete(streamSid);
+    streamAudienceRooms.delete(streamSid);
     setTimeout(() => {
       sessionSummaryLocks.delete(streamSid);
     }, 10 * 60 * 1000);
@@ -172,6 +200,39 @@ function parseClientIdentity(rawEndpoint) {
   const endpoint = rawEndpoint?.toString().trim() || "";
   if (!endpoint) return "";
   return endpoint.startsWith("client:") ? endpoint.slice(7) : endpoint;
+}
+
+function getAudienceRoomsForCall(callSid) {
+  const profile = callSid ? callRoleProfiles.get(callSid) : null;
+  if (!profile) {
+    return [];
+  }
+
+  const fromIdentity = parseClientIdentity(profile.from).toLowerCase();
+  const toIdentity = parseClientIdentity(profile.to).toLowerCase();
+  const identities = new Set();
+
+  if (fromIdentity) {
+    identities.add(fromIdentity);
+  }
+
+  if (toIdentity) {
+    identities.add(toIdentity);
+  }
+
+  return Array.from(identities).map(roomNameForIdentity);
+}
+
+function emitToStreamAudience(streamSid, eventName, payload) {
+  const audienceRooms = streamAudienceRooms.get(streamSid) || [];
+  if (audienceRooms.length === 0) {
+    console.warn("Skipping emit: no audience rooms mapped", { streamSid, eventName });
+    return;
+  }
+
+  for (const roomName of audienceRooms) {
+    io.to(roomName).emit(eventName, payload);
+  }
 }
 
 function inferInitiatorRole({ from, to, direction }) {
@@ -278,7 +339,7 @@ async function flushTranscriptionWindow(trackKey) {
       }
 
       console.log(`📝 [${speaker}]:`, transcriptText);
-      io.emit("transcript:chunk", transcriptData);
+      emitToStreamAudience(state.streamSid, "transcript:chunk", transcriptData);
 
       const hint = await generateRealtimeHint({
         latestText: transcriptText,
@@ -298,7 +359,7 @@ async function flushTranscriptionWindow(trackKey) {
           session.hints = session.hints.slice(-100);
         }
 
-        io.emit("copilot:hint", hintData);
+        emitToStreamAudience(state.streamSid, "copilot:hint", hintData);
       }
     }
   } catch (error) {
@@ -444,6 +505,8 @@ wss.on("connection", (socket, request) => {
 
         const mappedCallSid = callSid || (streamSid ? streamToCallSid.get(streamSid) : null);
         if (streamSid) {
+          streamAudienceRooms.set(streamSid, getAudienceRoomsForCall(mappedCallSid));
+
           // Pre-create both track states so VAD is ready before any packets arrive
           getOrCreateStreamState(
             `${streamSid}-inbound`,
@@ -533,6 +596,7 @@ wss.on("connection", (socket, request) => {
           setTimeout(() => {
             cleanupStreamState(`${rawSid}-inbound`);
             cleanupStreamState(`${rawSid}-outbound`);
+            streamAudienceRooms.delete(rawSid);
           }, 100);
         }
         console.log("Media stream stopped", { streamSid, mediaPacketCount });
@@ -557,6 +621,7 @@ wss.on("connection", (socket, request) => {
         callRoleProfiles.delete(mappedCallSid);
       }
       flushAllTracks(streamSid);
+      streamAudienceRooms.delete(streamSid);
     }
     console.log("Twilio media WebSocket disconnected", { streamSid, mediaPacketCount });
   });
