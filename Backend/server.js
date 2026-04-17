@@ -6,6 +6,8 @@ import http from "http";
 import { WebSocketServer } from "ws";
 import { Server as SocketIOServer } from "socket.io";
 import { transcribeTwilioMuLawChunk } from "./modules/copilot/transcription.service.js";
+import { generateRealtimeHint } from "./modules/copilot/hint.service.js";
+import { generateSessionSummary } from "./modules/copilot/summary.service.js";
 
 dotenv.config();
 
@@ -99,6 +101,50 @@ const agentIdentities = (process.env.AGENT_IDENTITIES || "")
 
 const callRoleProfiles = new Map(); // callSid -> { initiatorRole, from, to, direction }
 const streamToCallSid = new Map();  // streamSid -> callSid
+const copilotSessions = new Map();   // streamSid -> { conversation: [], hints: [] }
+const sessionSummaryLocks = new Set();
+
+function getOrCreateCopilotSession(streamSid) {
+  if (!copilotSessions.has(streamSid)) {
+    copilotSessions.set(streamSid, {
+      conversation: [],
+      hints: [],
+    });
+  }
+  return copilotSessions.get(streamSid);
+}
+
+async function emitSessionSummaryForStream(streamSid, reason) {
+  if (!streamSid || sessionSummaryLocks.has(streamSid)) {
+    return;
+  }
+
+  sessionSummaryLocks.add(streamSid);
+  const session = getOrCreateCopilotSession(streamSid);
+
+  try {
+    const summary = await generateSessionSummary({
+      conversation: session.conversation,
+      hints: session.hints,
+    });
+
+    io.emit("session:summary", {
+      streamSid,
+      reason,
+      ...summary,
+      transcriptLines: session.conversation.length,
+      hintsGenerated: session.hints.length,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error("Failed to emit session summary", { streamSid, error: error?.message || error });
+  } finally {
+    copilotSessions.delete(streamSid);
+    setTimeout(() => {
+      sessionSummaryLocks.delete(streamSid);
+    }, 10 * 60 * 1000);
+  }
+}
 
 // Inline µ-law → PCM decoder (avoids importing from transcription service)
 function decodeMuLawByte(b) {
@@ -219,8 +265,41 @@ async function flushTranscriptionWindow(trackKey) {
         byteLength,
         text: transcriptText,
       };
+
+      const session = getOrCreateCopilotSession(state.streamSid);
+      session.conversation.push({
+        speaker,
+        text: transcriptText,
+        timestamp: Date.now(),
+      });
+
+      if (session.conversation.length > 250) {
+        session.conversation = session.conversation.slice(-250);
+      }
+
       console.log(`📝 [${speaker}]:`, transcriptText);
       io.emit("transcript:chunk", transcriptData);
+
+      const hint = await generateRealtimeHint({
+        latestText: transcriptText,
+        conversation: session.conversation,
+      });
+
+      if (hint) {
+        const hintData = {
+          streamSid: state.streamSid,
+          speaker,
+          ...hint,
+          timestamp: new Date().toISOString(),
+        };
+
+        session.hints.push(hintData);
+        if (session.hints.length > 100) {
+          session.hints = session.hints.slice(-100);
+        }
+
+        io.emit("copilot:hint", hintData);
+      }
     }
   } catch (error) {
     console.error("Transcription flush failed", { trackKey, error: error?.message || error });
@@ -442,6 +521,8 @@ wss.on("connection", (socket, request) => {
       case "stop": {
         const rawSid = message.streamSid || streamSid;
         if (rawSid) {
+          void emitSessionSummaryForStream(rawSid, "stream-stop");
+
           const mappedCallSid = streamToCallSid.get(rawSid);
           if (mappedCallSid) {
             streamToCallSid.delete(rawSid);
@@ -468,6 +549,8 @@ wss.on("connection", (socket, request) => {
 
   socket.on("close", () => {
     if (streamSid) {
+      void emitSessionSummaryForStream(streamSid, "socket-close");
+
       const mappedCallSid = streamToCallSid.get(streamSid);
       if (mappedCallSid) {
         streamToCallSid.delete(streamSid);

@@ -19,6 +19,8 @@ function App() {
 
   // ── Transcript state ──────────────────────────────────────────────────────
   const [transcripts, setTranscripts]     = useState([]);
+  const [hints, setHints]                 = useState([]);
+  const [sessionSummary, setSessionSummary] = useState(null);
   const [socketConnected, setSocketConnected] = useState(false);
   const transcriptEndRef = useRef(null);
   const socketRef        = useRef(null);
@@ -46,6 +48,23 @@ function App() {
         ...prev,
         { ...data, timestamp: new Date().toLocaleTimeString() },
       ]);
+    });
+
+    socket.on("copilot:hint", (data) => {
+      setHints((prev) => {
+        const next = [
+          ...prev,
+          {
+            ...data,
+            timestamp: new Date().toLocaleTimeString(),
+          },
+        ];
+        return next.length > 80 ? next.slice(-80) : next;
+      });
+    });
+
+    socket.on("session:summary", (data) => {
+      setSessionSummary(data);
     });
 
     socketRef.current = socket;
@@ -117,6 +136,14 @@ function App() {
   function handleEndCall() {
     hangUpActiveCall();
     setCallStatus("idle");
+  }
+
+  async function copyTalkTrack(text) {
+    try {
+      await navigator.clipboard.writeText(text || "");
+    } catch (error) {
+      console.error("Failed to copy talk track", error);
+    }
   }
 
   // ── Status label helpers ──────────────────────────────────────────────────
@@ -256,13 +283,145 @@ function App() {
 
       {transcripts.length > 0 && (
         <button
-          onClick={() => setTranscripts([])}
+          onClick={() => {
+            setTranscripts([]);
+            setHints([]);
+            setSessionSummary(null);
+          }}
           style={{ marginTop: "10px", padding: "5px 12px", fontSize: "12px", cursor: "pointer",
             border: "1px solid #d1d5db", borderRadius: "4px", backgroundColor: "#fff" }}
         >
-          Clear transcripts
+          Clear copilot feed
         </button>
       )}
+
+      {/* ── AI Hints ─────────────────────────────────────────────────────── */}
+      <div style={{ marginTop: "22px" }}>
+        <h3 style={{ marginBottom: "8px" }}>Live AI Hints</h3>
+        <div style={{
+          border: "1px solid #d1d5db",
+          borderRadius: "8px",
+          padding: "16px",
+          backgroundColor: "#f9fafb",
+          maxHeight: "380px",
+          overflowY: "auto",
+        }}>
+          {hints.length === 0 ? (
+            <p style={{ color: "#9ca3af", margin: 0 }}>
+              No hints yet. Start talking and AI coaching will appear here.
+            </p>
+          ) : (
+            hints.map((hint, index) => {
+              const typeColors = {
+                OBJECTION: "#dc2626",
+                QUESTION: "#2563eb",
+                BUYING_SIGNAL: "#16a34a",
+                COACHING: "#ca8a04",
+              };
+
+              const borderColor = typeColors[hint.type] || "#6b7280";
+
+              return (
+                <div
+                  key={`${hint.timestamp}-${index}`}
+                  style={{
+                    backgroundColor: "#fff",
+                    border: "1px solid #e5e7eb",
+                    borderLeft: `4px solid ${borderColor}`,
+                    borderRadius: "6px",
+                    padding: "12px",
+                    marginBottom: "10px",
+                  }}
+                >
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: "8px" }}>
+                    <span style={{ color: borderColor, fontSize: "11px", fontWeight: 700, letterSpacing: "0.04em" }}>
+                      {hint.type}
+                    </span>
+                    <span style={{ color: "#9ca3af", fontSize: "11px" }}>{hint.timestamp}</span>
+                  </div>
+
+                  <div style={{ marginTop: "6px", fontSize: "14px", fontWeight: 600, color: "#111827" }}>
+                    {hint.hint}
+                  </div>
+
+                  <div style={{ marginTop: "4px", fontSize: "13px", color: "#374151" }}>
+                    {hint.detail}
+                  </div>
+
+                  <div style={{ marginTop: "10px", fontSize: "11px", fontWeight: 700, color: "#6b7280" }}>
+                    SAY THIS
+                  </div>
+                  <div style={{ marginTop: "4px", padding: "8px", backgroundColor: "#f3f4f6", borderRadius: "6px", fontSize: "13px", color: "#1f2937" }}>
+                    {hint.talkTrack}
+                  </div>
+
+                  <div style={{ marginTop: "8px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <span style={{ fontSize: "11px", color: "#6b7280" }}>
+                      Confidence: {Math.round((hint.confidence || 0) * 100)}%
+                    </span>
+                    <button
+                      onClick={() => copyTalkTrack(hint.talkTrack)}
+                      style={{ ...btnStyle, backgroundColor: "#111827", color: "#fff", padding: "5px 10px", fontSize: "11px" }}
+                    >
+                      Copy
+                    </button>
+                  </div>
+                </div>
+              );
+            })
+          )}
+        </div>
+      </div>
+
+      {/* ── Session Summary ──────────────────────────────────────────────── */}
+      <div style={{ marginTop: "22px", marginBottom: "20px" }}>
+        <h3 style={{ marginBottom: "8px" }}>Post-Session Summary</h3>
+        <div style={{ border: "1px solid #d1d5db", borderRadius: "8px", padding: "16px", backgroundColor: "#f9fafb" }}>
+          {!sessionSummary ? (
+            <p style={{ color: "#9ca3af", margin: 0 }}>Summary appears after the call ends.</p>
+          ) : (
+            <>
+              <div style={{ display: "flex", gap: "14px", flexWrap: "wrap", marginBottom: "10px" }}>
+                <span style={badgeStyle}>Sentiment: {sessionSummary.sentiment}</span>
+                <span style={badgeStyle}>Deal Probability: {sessionSummary.dealProbability}%</span>
+                <span style={badgeStyle}>Rep Score: {sessionSummary.repScore}/10</span>
+              </div>
+
+              <div style={{ marginBottom: "10px", color: "#374151", fontSize: "13px" }}>
+                {sessionSummary.executiveSummary}
+              </div>
+
+              <div style={{ marginBottom: "10px" }}>
+                <div style={{ fontSize: "12px", fontWeight: 700, color: "#4b5563", marginBottom: "5px" }}>Next Best Action</div>
+                <div style={{ fontSize: "13px", color: "#111827" }}>{sessionSummary.nextBestAction}</div>
+              </div>
+
+              <div style={{ marginBottom: "10px" }}>
+                <div style={{ fontSize: "12px", fontWeight: 700, color: "#4b5563", marginBottom: "5px" }}>Action Items</div>
+                {(sessionSummary.actionItems || []).map((item, idx) => (
+                  <div key={idx} style={{ fontSize: "13px", color: "#374151", marginBottom: "4px" }}>
+                    [{(item.priority || "medium").toUpperCase()}] {item.task}
+                  </div>
+                ))}
+              </div>
+
+              <div style={{ marginBottom: "10px" }}>
+                <div style={{ fontSize: "12px", fontWeight: 700, color: "#4b5563", marginBottom: "5px" }}>Hint Breakdown</div>
+                <div style={{ fontSize: "13px", color: "#374151" }}>
+                  OBJECTION {sessionSummary?.hintBreakdown?.OBJECTION || 0} | QUESTION {sessionSummary?.hintBreakdown?.QUESTION || 0} | BUYING_SIGNAL {sessionSummary?.hintBreakdown?.BUYING_SIGNAL || 0} | COACHING {sessionSummary?.hintBreakdown?.COACHING || 0}
+                </div>
+              </div>
+
+              <div>
+                <div style={{ fontSize: "12px", fontWeight: 700, color: "#4b5563", marginBottom: "5px" }}>Follow-Up Email Draft</div>
+                <div style={{ fontSize: "13px", color: "#1f2937", backgroundColor: "#fff", border: "1px solid #e5e7eb", borderRadius: "6px", padding: "10px" }}>
+                  {sessionSummary.followUpEmail}
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
@@ -285,6 +444,15 @@ const btnStyle = {
   borderRadius: "6px",
   cursor: "pointer",
   whiteSpace: "nowrap",
+};
+
+const badgeStyle = {
+  fontSize: "12px",
+  color: "#111827",
+  backgroundColor: "#e5e7eb",
+  borderRadius: "999px",
+  padding: "5px 10px",
+  fontWeight: 600,
 };
 
 export default App;
