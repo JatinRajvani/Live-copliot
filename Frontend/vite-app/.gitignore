@@ -13,6 +13,8 @@ dist-ssr
 *.local
 .env
 copilot_risks_and_gaps.md
+imporvements.md
+
 
 # Editor directories and files
 .vscode/*

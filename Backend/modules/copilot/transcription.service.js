@@ -1,4 +1,6 @@
 import Groq from "groq-sdk";
+import { spawn } from "node:child_process";
+import ffmpegPath from "ffmpeg-static";
 
 // Twilio sends 8 kHz µ-law. We upsample to 16 kHz before sending to Whisper
 // because Whisper is trained on 16 kHz audio — giving it 8 kHz causes it to
@@ -15,6 +17,7 @@ const SILENCE_RMS_THRESHOLD = 300;
 // Minimum raw µ-law bytes before sending to Whisper (~400 ms at 8 kHz).
 // Checked BEFORE upsampling so the byte count stays consistent.
 const MIN_PACKET_BYTES = 3200;
+const ENABLE_FFMPEG_UPSAMPLE = (process.env.COPILOT_USE_FFMPEG_UPSAMPLE || "true").toLowerCase() !== "false";
 
 // ── Whisper Initial Prompt ────────────────────────────────────────────────────
 // IMPORTANT: Whisper's `prompt` must look like real transcript text, NOT a
@@ -119,7 +122,7 @@ function muLawToPcm16Buffer(muLawBuffer) {
  * This doubles the buffer length. Whisper is trained on 16 kHz audio, so this
  * significantly improves phoneme recognition accuracy.
  */
-function upsample8kTo16k(pcm8kBuffer) {
+function upsample8kTo16kLinear(pcm8kBuffer) {
   const sampleCount = pcm8kBuffer.length / 2; // 16-bit samples
   const out = Buffer.alloc(sampleCount * 4);  // 2× samples × 2 bytes each
 
@@ -133,6 +136,75 @@ function upsample8kTo16k(pcm8kBuffer) {
   }
 
   return out;
+}
+
+function upsample8kTo16kFFmpeg(pcm8kBuffer) {
+  return new Promise((resolve, reject) => {
+    if (!ffmpegPath) {
+      reject(new Error("ffmpeg-static binary not found"));
+      return;
+    }
+
+    const ffmpeg = spawn(ffmpegPath, [
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-f",
+      "s16le",
+      "-ar",
+      String(INPUT_SAMPLE_RATE),
+      "-ac",
+      String(NUM_CHANNELS),
+      "-i",
+      "pipe:0",
+      "-f",
+      "s16le",
+      "-ar",
+      String(OUTPUT_SAMPLE_RATE),
+      "-ac",
+      String(NUM_CHANNELS),
+      "pipe:1",
+    ]);
+
+    const stdoutChunks = [];
+    const stderrChunks = [];
+
+    ffmpeg.stdout.on("data", (chunk) => stdoutChunks.push(chunk));
+    ffmpeg.stderr.on("data", (chunk) => stderrChunks.push(chunk));
+    ffmpeg.on("error", (error) => reject(error));
+    ffmpeg.on("close", (code) => {
+      if (code !== 0) {
+        const stderrText = Buffer.concat(stderrChunks).toString("utf8").trim();
+        reject(new Error(`ffmpeg exited with code ${code}: ${stderrText}`));
+        return;
+      }
+
+      resolve(Buffer.concat(stdoutChunks));
+    });
+
+    ffmpeg.stdin.end(pcm8kBuffer);
+  });
+}
+
+async function upsample8kTo16k(pcm8kBuffer) {
+  if (!ENABLE_FFMPEG_UPSAMPLE) {
+    return upsample8kTo16kLinear(pcm8kBuffer);
+  }
+
+  try {
+    return await upsample8kTo16kFFmpeg(pcm8kBuffer);
+  } catch (error) {
+    console.warn(`FFmpeg upsampling failed, falling back to linear interpolation: ${error.message}`);
+    return upsample8kTo16kLinear(pcm8kBuffer);
+  }
+}
+
+export async function upsamplePcm16From8kTo16k(pcm8kBuffer) {
+  if (!Buffer.isBuffer(pcm8kBuffer)) {
+    throw new TypeError("Expected a Buffer containing 16-bit PCM samples");
+  }
+
+  return upsample8kTo16k(pcm8kBuffer);
 }
 
 function buildWavHeader(dataLength, sampleRate) {
@@ -157,9 +229,9 @@ function buildWavHeader(dataLength, sampleRate) {
   return wavHeader;
 }
 
-function muLawToWavBuffer(muLawBuffer) {
+async function muLawToWavBuffer(muLawBuffer) {
   const pcm8k   = muLawToPcm16Buffer(muLawBuffer);  // decode µ-law → 8 kHz PCM
-  const pcm16k  = upsample8kTo16k(pcm8k);           // upsample to 16 kHz
+  const pcm16k  = await upsample8kTo16k(pcm8k);     // upsample to 16 kHz
   const header  = buildWavHeader(pcm16k.length, OUTPUT_SAMPLE_RATE);
   return Buffer.concat([header, pcm16k]);
 }
@@ -196,7 +268,7 @@ export async function transcribeTwilioMuLawChunk(muLawBuffer) {
     return "";
   }
 
-  const wavBuffer = muLawToWavBuffer(muLawBuffer); // 8kHz µ-law → 16kHz WAV
+  const wavBuffer = await muLawToWavBuffer(muLawBuffer); // 8kHz µ-law → 16kHz WAV
   const wavFile   = new File([wavBuffer], "audio.wav", { type: "audio/wav" });
 
   const response = await client.audio.transcriptions.create({
