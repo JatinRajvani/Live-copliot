@@ -18,15 +18,19 @@ const SILENCE_RMS_THRESHOLD = 300;
 // Checked BEFORE upsampling so the byte count stays consistent.
 const MIN_PACKET_BYTES = 3200;
 const ENABLE_FFMPEG_UPSAMPLE = (process.env.COPILOT_USE_FFMPEG_UPSAMPLE || "true").toLowerCase() !== "false";
+const STT_PROVIDER = (process.env.COPILOT_STT_PROVIDER || "groq").toLowerCase().trim();
+const STT_MODEL = process.env.COPILOT_STT_MODEL?.toString().trim() || "whisper-large-v3";
+const DEEPGRAM_MODEL = process.env.DEEPGRAM_MODEL?.toString().trim() || "nova-2";
+const DEEPGRAM_SMART_FORMAT = (process.env.DEEPGRAM_SMART_FORMAT || "true").toLowerCase() !== "false";
+const DEEPGRAM_PUNCTUATE = (process.env.DEEPGRAM_PUNCTUATE || "true").toLowerCase() !== "false";
+const DEEPGRAM_FALLBACK_TO_GROQ = (process.env.DEEPGRAM_FALLBACK_TO_GROQ || "true").toLowerCase() !== "false";
+let hasLoggedSttConfig = false;
 
-// ── Whisper Initial Prompt ────────────────────────────────────────────────────
-// IMPORTANT: Whisper's `prompt` must look like real transcript text, NOT a
-// description/list. Whisper uses it to "prime" vocabulary and style.
-// Write it as if it's the beginning of the conversation being transcribed.
-const WHISPER_PROMPT =
-  "My name is Jatin Rajvani. I am currently studying B.Tech at Rai University. " +
-  "I live in a hostel, room number 95. I am pursuing my B.Tech degree from CodingGita " +
-  "and Rai University. My friends are Rahul and Priya. We are doing a project on placement.";
+// ── Whisper Prompt/Language Configuration ─────────────────────────────────────
+// Keep prompt neutral and domain-driven via env; avoid hardcoded personal text.
+const WHISPER_PROMPT = process.env.COPILOT_STT_PROMPT?.toString().trim() || "";
+// Use auto-detection by default. Set COPILOT_STT_LANGUAGE=en/hi/etc. to force one.
+const WHISPER_LANGUAGE = process.env.COPILOT_STT_LANGUAGE?.toString().trim() || "";
 
 // ── Hallucination Filter ──────────────────────────────────────────────────────
 // Whisper hallucinates these phrases on low-quality/silent phone audio.
@@ -236,7 +240,91 @@ async function muLawToWavBuffer(muLawBuffer) {
   return Buffer.concat([header, pcm16k]);
 }
 
+async function transcribeWithGroq(wavBuffer) {
+  const client = getGroqClient();
+  if (!client) {
+    console.warn("Skipping Groq transcription: GROQ_API_KEY is missing");
+    return "";
+  }
+
+  const wavFile = new File([wavBuffer], "audio.wav", { type: "audio/wav" });
+  const requestPayload = {
+    file: wavFile,
+    model: STT_MODEL,
+    response_format: "json",
+    temperature: 0,
+  };
+
+  if (WHISPER_LANGUAGE) {
+    requestPayload.language = WHISPER_LANGUAGE;
+  }
+
+  if (WHISPER_PROMPT) {
+    requestPayload.prompt = WHISPER_PROMPT;
+  }
+
+  const response = await client.audio.transcriptions.create(requestPayload);
+  return response?.text?.trim() || "";
+}
+
+function buildDeepgramUrl() {
+  const query = new URLSearchParams();
+  query.set("model", DEEPGRAM_MODEL);
+  query.set("smart_format", DEEPGRAM_SMART_FORMAT ? "true" : "false");
+  query.set("punctuate", DEEPGRAM_PUNCTUATE ? "true" : "false");
+
+  if (WHISPER_LANGUAGE) {
+    query.set("language", WHISPER_LANGUAGE);
+  }
+
+  return `https://api.deepgram.com/v1/listen?${query.toString()}`;
+}
+
+async function transcribeWithDeepgram(wavBuffer) {
+  const deepgramApiKey = process.env.DEEPGRAM_API_KEY?.toString().trim();
+  if (!deepgramApiKey) {
+    console.warn("Skipping Deepgram transcription: DEEPGRAM_API_KEY is missing");
+    return "";
+  }
+
+  const response = await fetch(buildDeepgramUrl(), {
+    method: "POST",
+    headers: {
+      Authorization: `Token ${deepgramApiKey}`,
+      "Content-Type": "audio/wav",
+    },
+    body: wavBuffer,
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Deepgram request failed (${response.status}): ${errorText}`);
+  }
+
+  const payload = await response.json();
+  return payload?.results?.channels?.[0]?.alternatives?.[0]?.transcript?.toString().trim() || "";
+}
+
+function logSttConfigOnce() {
+  if (hasLoggedSttConfig) {
+    return;
+  }
+
+  const providerModel = STT_PROVIDER === "deepgram" ? DEEPGRAM_MODEL : STT_MODEL;
+  console.log("[STT] Active configuration", {
+    provider: STT_PROVIDER,
+    model: providerModel,
+    language: WHISPER_LANGUAGE || "auto",
+    ffmpegUpsample: ENABLE_FFMPEG_UPSAMPLE,
+    deepgramFallbackToGroq: STT_PROVIDER === "deepgram" ? DEEPGRAM_FALLBACK_TO_GROQ : false,
+  });
+
+  hasLoggedSttConfig = true;
+}
+
 export async function transcribeTwilioMuLawChunk(muLawBuffer) {
+  logSttConfigOnce();
+
   if (!muLawBuffer || muLawBuffer.length === 0) {
     return "";
   }
@@ -260,27 +348,29 @@ export async function transcribeTwilioMuLawChunk(muLawBuffer) {
     return "";
   }
 
-  console.log(`🎙️  Sending to Whisper | RMS: ${rms.toFixed(0)} | raw: ${muLawBuffer.length}B → upsampled WAV @ 16kHz`);
-
-  const client = getGroqClient();
-  if (!client) {
-    console.warn("Skipping transcription: GROQ_API_KEY is missing");
-    return "";
-  }
+  console.log(`🎙️  Sending to ${STT_PROVIDER} STT | RMS: ${rms.toFixed(0)} | raw: ${muLawBuffer.length}B → upsampled WAV @ 16kHz`);
 
   const wavBuffer = await muLawToWavBuffer(muLawBuffer); // 8kHz µ-law → 16kHz WAV
-  const wavFile   = new File([wavBuffer], "audio.wav", { type: "audio/wav" });
+  let text = "";
 
-  const response = await client.audio.transcriptions.create({
-    file:            wavFile,
-    model:           "whisper-large-v3",  // full accuracy model (not turbo)
-    language:        "en",
-    response_format: "json",
-    temperature:     0,
-    prompt:          WHISPER_PROMPT,       // accent + domain context
-  });
+  try {
+    if (STT_PROVIDER === "deepgram") {
+      text = await transcribeWithDeepgram(wavBuffer);
+      if (!text && DEEPGRAM_FALLBACK_TO_GROQ) {
+        text = await transcribeWithGroq(wavBuffer);
+      }
+    } else {
+      text = await transcribeWithGroq(wavBuffer);
+    }
+  } catch (error) {
+    console.error("Primary STT provider failed", error?.message || error);
 
-  const text = response?.text?.trim() || "";
+    if (STT_PROVIDER === "deepgram" && DEEPGRAM_FALLBACK_TO_GROQ) {
+      text = await transcribeWithGroq(wavBuffer);
+    } else {
+      return "";
+    }
+  }
 
   // ── Guard 3: Hallucination filter ────────────────────────────────────────
   // Whisper frequently outputs "Thank you.", "Thanks for watching." etc. on

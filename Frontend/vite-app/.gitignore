@@ -12,8 +12,9 @@ dist
 dist-ssr
 *.local
 .env
+improve.md
 copilot_risks_and_gaps.md
-imporvements.md
+
 
 
 # Editor directories and files

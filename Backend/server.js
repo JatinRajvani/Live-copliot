@@ -1,6 +1,6 @@
+import "dotenv/config";
 import express from "express";
 import cors from "cors";
-import dotenv from "dotenv";
 import twilio from "twilio";
 import jwt from "jsonwebtoken";
 import http from "http";
@@ -10,8 +10,6 @@ import { transcribeTwilioMuLawChunk } from "./modules/copilot/transcription.serv
 import { generateRealtimeHint } from "./modules/copilot/hint.service.js";
 import { generateSessionSummary } from "./modules/copilot/summary.service.js";
 import { getUserFromTokenClaims, loginUser, registerUser } from "./modules/auth/auth.service.js";
-
-dotenv.config();
 
 const rawAllowedOrigins = process.env.ALLOWED_ORIGINS || "http://localhost:5173";
 
