@@ -2,6 +2,24 @@ import Groq from "groq-sdk";
 
 const HINT_MODEL = process.env.GROQ_HINT_MODEL?.toString().trim() || "llama-3.3-70b-versatile";
 const MAX_CONTEXT_LINES = Number(process.env.COPILOT_MAX_CONTEXT_LINES || 12);
+const ENABLE_DOMAIN_GROUNDING = (process.env.COPILOT_ENABLE_DOMAIN_GROUNDING || "true").toLowerCase() !== "false";
+
+const DOMAIN_PRODUCTS = [
+  {
+    name: "VoiceStream Pro",
+    category: "Call Intelligence",
+    pricing: "INR 1900/month",
+    features: ["Live transcription", "Realtime AI hints", "Post-call summary"],
+    keywords: ["voicestream pro", "voice stream pro", "transcription", "live copilot"],
+  },
+  {
+    name: "Tata Nexon",
+    category: "SUV",
+    pricing: "INR 8-15 lakh",
+    features: ["5-star safety", "Touchscreen infotainment", "Petrol/Diesel options"],
+    keywords: ["tata nexon", "nexon"],
+  },
+];
 
 let groqClient = null;
 
@@ -55,6 +73,28 @@ function buildContextText(conversation) {
   return lines.join("\n");
 }
 
+function buildDomainGroundingText(latestText, conversation) {
+  if (!ENABLE_DOMAIN_GROUNDING) {
+    return "";
+  }
+
+  const corpus = `${latestText || ""}\n${buildContextText(conversation)}`.toLowerCase();
+  const matches = DOMAIN_PRODUCTS.filter((product) =>
+    product.keywords.some((keyword) => corpus.includes(keyword.toLowerCase()))
+  );
+
+  if (matches.length === 0) {
+    return "";
+  }
+
+  return matches
+    .map(
+      (product, index) =>
+        `${index + 1}. ${product.name} | ${product.category} | ${product.pricing} | Features: ${product.features.join(", ")}`
+    )
+    .join("\n");
+}
+
 function heuristicFallback(latestText) {
   const text = (latestText || "").toLowerCase();
 
@@ -105,7 +145,7 @@ function heuristicFallback(latestText) {
   };
 }
 
-export async function generateRealtimeHint({ latestText, conversation }) {
+export async function generateRealtimeHint({ latestText, conversation, entityContext }) {
   const fallback = heuristicFallback(latestText);
   const client = getGroqClient();
   if (!client) {
@@ -113,14 +153,22 @@ export async function generateRealtimeHint({ latestText, conversation }) {
   }
 
   const prompt = [
-    "You are a live sales copilot.",
+    "You are a realtime AI sales copilot for live calls.",
     "Return ONLY strict JSON with keys: type, hint, detail, talkTrack, trigger, confidence.",
     "Allowed type values: OBJECTION, QUESTION, BUYING_SIGNAL, COACHING.",
+    "Never ask the user to ask the customer again.",
+    "Always provide direct, useful, actionable guidance.",
+    "Be concise and confident.",
+    "Use product and entity context when available.",
     "talkTrack must be natural speech, <= 3 sentences, and end with a question.",
     "Do not include markdown.",
   ].join(" ");
 
   const contextText = buildContextText(conversation);
+  const domainGroundingText = buildDomainGroundingText(latestText, conversation);
+  const entityContextText = entityContext
+    ? JSON.stringify(entityContext)
+    : "{}";
 
   try {
     const response = await client.chat.completions.create({
@@ -131,7 +179,7 @@ export async function generateRealtimeHint({ latestText, conversation }) {
         { role: "system", content: prompt },
         {
           role: "user",
-          content: `Conversation context:\n${contextText}\n\nLatest line:\n${latestText}`,
+          content: `Conversation context:\n${contextText}\n\nEntity context:\n${entityContextText}\n\nDomain grounding:\n${domainGroundingText || "None"}\n\nLatest line:\n${latestText}`,
         },
       ],
     });

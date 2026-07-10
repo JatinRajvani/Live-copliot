@@ -218,6 +218,40 @@ const SILENCE_RMS_THRESHOLD = 180;   // RMS below this (with hysteresis) = silen
 const SILENCE_DEBOUNCE_MS   = 600;   // flush 600 ms after last speech packet
 const MAX_UTTERANCE_MS      = 14000; // safety: force-flush after 14 s of speech
 const MIN_FLUSH_BYTES       = 3200;  // ~400 ms of 8-kHz audio — skip shorter clips
+const STT_STABILIZATION_MS  = Number(process.env.STT_STABILIZATION_MS || 350); // wait before STT to merge trailing packets
+const STABLE_TRANSCRIPT_DEDUP_MS = Number(process.env.STABLE_TRANSCRIPT_DEDUP_MS || 1200);
+const MIN_TRANSCRIPT_CHARS = Number(process.env.MIN_TRANSCRIPT_CHARS || 3);
+const ENABLE_TRANSCRIPT_QUALITY_GATE = (process.env.ENABLE_TRANSCRIPT_QUALITY_GATE || "true").toLowerCase() !== "false";
+
+const TRANSCRIPT_CORRECTIONS = [
+  { from: /\byatin\b/gi, to: "Jatin" },
+  { from: /\byapin\b/gi, to: "Jatin" },
+  { from: /\braul\b/gi, to: "Rahul" },
+  { from: /\bexxon\b/gi, to: "Nexon" },
+  { from: /\bexon\b/gi, to: "Nexon" },
+  { from: /\bnixon\b/gi, to: "Nexon" },
+  { from: /\btexon\b/gi, to: "Nexon" },
+  { from: /\bherrier\b/gi, to: "Harrier" },
+  { from: /\bhairier\b/gi, to: "Harrier" },
+  { from: /\bbarrier\b/gi, to: "Harrier" },
+  { from: /\bhead\s+what\s+to\s+do\b/gi, to: "Harrier" },
+  { from: /\bsting\s+voice\s+systems\s+pro\b/gi, to: "VoiceStream Pro" },
+  { from: /\bvoice\s*stream\s*pro\b/gi, to: "VoiceStream Pro" },
+  { from: /\bvoice\s*sync\b/gi, to: "voice" },
+  { from: /\becna\s+voice\s+system\b/gi, to: "Acme Voice Systems" },
+  { from: /\becmo\s+oil\s+systems\b/gi, to: "Acme Voice Systems" },
+];
+
+const REJECTED_TRANSCRIPT_PATTERNS = [
+  /^\W+$/,
+  /^\d+(\s+\d+){0,1}$/,
+  /^thanks for watching\.?$/i,
+  /^thank you for watching\.?$/i,
+  /^you for watching\.?$/i,
+  /^you for (?:today|help|the help)\.?$/i,
+  /^this line is punctuation test only\.?$/i,
+  /^voice\s*stream\s*pro\.?$/i,
+];
 
 const agentIdentities = (process.env.AGENT_IDENTITIES || "")
   .split(",")
@@ -391,12 +425,311 @@ function getOrCreateStreamState(trackKey, streamSid, speaker) {
       isSpeaking: false,
       silenceTimer: null,
       maxTimer: null,
+      sttStabilizeTimer: null,
+      lastStableTextKey: "",
+      lastStableAt: 0,
     });
   }
   return streamStates.get(trackKey);
 }
 
+function normalizeTranscriptText(text) {
+  return (text || "")
+    .toString()
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+function normalizeForDedup(text) {
+  return normalizeTranscriptText(text)
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, "")
+    .trim();
+}
+
+function shouldAcceptStableTranscript(state, transcriptText) {
+  const dedupKey = normalizeForDedup(transcriptText);
+  if (!dedupKey) {
+    return { accepted: false, reason: "empty-normalized" };
+  }
+
+  const now = Date.now();
+  const isRecentDuplicate =
+    dedupKey === state.lastStableTextKey &&
+    now - state.lastStableAt < STABLE_TRANSCRIPT_DEDUP_MS;
+
+  if (isRecentDuplicate) {
+    return { accepted: false, reason: "duplicate-stable-window", dedupKey };
+  }
+
+  state.lastStableTextKey = dedupKey;
+  state.lastStableAt = now;
+  return { accepted: true, dedupKey };
+}
+
+function applyDeterministicCorrections(transcriptText) {
+  let corrected = normalizeTranscriptText(transcriptText);
+
+  for (const rule of TRANSCRIPT_CORRECTIONS) {
+    corrected = corrected.replace(rule.from, rule.to);
+  }
+
+  return corrected;
+}
+
+function evaluateTranscriptQuality(transcriptText) {
+  const text = normalizeTranscriptText(transcriptText);
+
+  if (!ENABLE_TRANSCRIPT_QUALITY_GATE) {
+    return { accepted: true, text };
+  }
+
+  if (!text) {
+    return { accepted: false, reason: "empty" };
+  }
+
+  if (text.length < MIN_TRANSCRIPT_CHARS) {
+    return { accepted: false, reason: `too-short:${text.length}` };
+  }
+
+  // Single short token utterances are usually unstable artifacts in call audio.
+  const tokenCount = text.split(/\s+/).filter(Boolean).length;
+  if (tokenCount === 1 && text.length <= 4) {
+    return { accepted: false, reason: `single-short-token:${text}` };
+  }
+
+  for (const pattern of REJECTED_TRANSCRIPT_PATTERNS) {
+    if (pattern.test(text)) {
+      return { accepted: false, reason: `pattern-rejected:${pattern}` };
+    }
+  }
+
+  return { accepted: true, text };
+}
+
+function logTranscriptStage(stage, payload) {
+  const entry = {
+    ts: new Date().toISOString(),
+    stage,
+    ...payload,
+  };
+  console.log(`[TRANSCRIPT:${stage}]`, entry);
+}
+
+const NUMBER_WORDS = {
+  zero: 0,
+  one: 1,
+  two: 2,
+  three: 3,
+  four: 4,
+  five: 5,
+  six: 6,
+  seven: 7,
+  eight: 8,
+  nine: 9,
+  ten: 10,
+  eleven: 11,
+  twelve: 12,
+  thirteen: 13,
+  fourteen: 14,
+  fifteen: 15,
+  sixteen: 16,
+  seventeen: 17,
+  eighteen: 18,
+  nineteen: 19,
+  twenty: 20,
+  thirty: 30,
+  forty: 40,
+  fifty: 50,
+};
+
+const MONTH_INDEX = {
+  january: "01",
+  february: "02",
+  march: "03",
+  april: "04",
+  may: "05",
+  june: "06",
+  july: "07",
+  august: "08",
+  september: "09",
+  october: "10",
+  november: "11",
+  december: "12",
+};
+
+const ORDINAL_WORDS = {
+  first: "01",
+  second: "02",
+  third: "03",
+  fourth: "04",
+  fifth: "05",
+  sixth: "06",
+  seventh: "07",
+  eighth: "08",
+  ninth: "09",
+  tenth: "10",
+  eleventh: "11",
+  twelfth: "12",
+  thirteenth: "13",
+  fourteenth: "14",
+  fifteenth: "15",
+  sixteenth: "16",
+  seventeenth: "17",
+  eighteenth: "18",
+  nineteenth: "19",
+  twentieth: "20",
+  twentyfirst: "21",
+  twentysecond: "22",
+  twentythird: "23",
+  twentyfourth: "24",
+  twentyfifth: "25",
+  twentysixth: "26",
+  twentyseventh: "27",
+  twentyeighth: "28",
+  twentyninth: "29",
+  thirtieth: "30",
+  thirtyfirst: "31",
+};
+
+function wordToNumberToken(token) {
+  const normalized = token?.toLowerCase().trim() || "";
+  if (!normalized) {
+    return null;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(NUMBER_WORDS, normalized)) {
+    return String(NUMBER_WORDS[normalized]);
+  }
+
+  if (/^\d+$/.test(normalized)) {
+    return normalized;
+  }
+
+  return null;
+}
+
+function normalizeSpokenId(rawId) {
+  return (rawId || "")
+    .toUpperCase()
+    .replace(/ZED/gi, "Z")
+    .replace(/[^A-Z0-9]/g, "");
+}
+
+function normalizeSpokenDateTime(text) {
+  const match = text.match(/\b(twenty\s+fifth|[a-z]+)\s+([a-z]+)\s+twenty\s+twenty\s+(six|seven|eight|nine)\b(?:\s+at\s+(\d{1,2}:\d{2}\s*(?:am|pm)?))?/i);
+  if (!match) {
+    return null;
+  }
+
+  const ordinalToken = match[1].toLowerCase().replace(/\s+/g, "");
+  const monthToken = match[2].toLowerCase();
+  const yearTailToken = match[3].toLowerCase();
+  const timeToken = match[4] ? match[4].toUpperCase().replace(/\s+/g, "") : "";
+
+  const day = ORDINAL_WORDS[ordinalToken] || null;
+  const month = MONTH_INDEX[monthToken] || null;
+  const yearTail = wordToNumberToken(yearTailToken);
+
+  if (!day || !month || yearTail === null) {
+    return null;
+  }
+
+  const year = `20${yearTail.padStart(2, "0")}`;
+  return {
+    source: match[0],
+    normalized: `${day}/${month}/${year}${timeToken ? ` ${timeToken}` : ""}`,
+  };
+}
+
+function normalizeCriticalEntitiesForAi(inputText) {
+  let normalizedText = normalizeTranscriptText(inputText);
+  const entities = {
+    orderIds: [],
+    pricesInr: [],
+    versions: [],
+    dateTimes: [],
+    longNumbers: [],
+  };
+
+  const orderIdMatch = normalizedText.match(/\b(?:backup\s+|pickup\s+)?order\s*(?:id|number)?\s*(?:is|:)\s*([a-z0-9\s-]{6,})\b/i);
+  if (orderIdMatch) {
+    const rawOrderId = normalizeSpokenId(orderIdMatch[1]);
+    if (rawOrderId.length >= 6) {
+      entities.orderIds.push(rawOrderId);
+      normalizedText = normalizedText.replace(orderIdMatch[1], rawOrderId);
+    }
+  }
+
+  const priceMatch = normalizedText.match(/\b(\d{1,3}(?:,\d{3})+|\d+)\s*(?:rupees|rs\.?|inr)\b/i);
+  if (priceMatch) {
+    const value = priceMatch[1].replace(/,/g, "");
+    entities.pricesInr.push(value);
+    normalizedText = normalizedText.replace(priceMatch[0], `INR ${value}`);
+  }
+
+  const spokenVersion = normalizedText.match(/\b([a-z0-9]+)\s+point\s+([a-z0-9]+)\s+point\s+([a-z0-9]+)\b/i);
+  if (spokenVersion) {
+    const major = wordToNumberToken(spokenVersion[1]);
+    const minor = wordToNumberToken(spokenVersion[2]);
+    const patch = wordToNumberToken(spokenVersion[3]);
+    if (major !== null && minor !== null && patch !== null) {
+      const normalizedVersion = `${major}.${minor}.${patch}`;
+      entities.versions.push(normalizedVersion);
+      normalizedText = normalizedText.replace(spokenVersion[0], normalizedVersion);
+    }
+  }
+
+  const numericVersion = normalizedText.match(/\b\d+(?:\.\d+){2,}\b/);
+  if (numericVersion) {
+    entities.versions.push(numericVersion[0]);
+  }
+
+  const splitNumericVersion = normalizedText.match(/\b(\d+)\s+(\d+\.\d+)\b/);
+  if (splitNumericVersion) {
+    const normalizedVersion = `${splitNumericVersion[1]}.${splitNumericVersion[2]}`;
+    entities.versions.push(normalizedVersion);
+    normalizedText = normalizedText.replace(splitNumericVersion[0], normalizedVersion);
+  }
+
+  const dateTimeMatch = normalizedText.match(/\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b(?:\s+at\s+\d{1,2}:\d{2}\s*(?:am|pm)?)?/i);
+  if (dateTimeMatch) {
+    entities.dateTimes.push(dateTimeMatch[0]);
+  }
+
+  const spokenDateTime = normalizeSpokenDateTime(normalizedText);
+  if (spokenDateTime) {
+    entities.dateTimes.push(spokenDateTime.normalized);
+    normalizedText = normalizedText.replace(spokenDateTime.source, spokenDateTime.normalized);
+  }
+
+  const longNumberMatches = normalizedText.match(/\b\d{8,}\b/g) || [];
+  if (longNumberMatches.length) {
+    entities.longNumbers.push(...longNumberMatches);
+  }
+
+  return {
+    normalizedText,
+    entities,
+  };
+}
+
 // ── Flush & Transcribe ────────────────────────────────────────────────────────
+function scheduleSttFlush(trackKey, reason, delayMs = STT_STABILIZATION_MS) {
+  const state = streamStates.get(trackKey);
+  if (!state) return;
+
+  clearTimeout(state.sttStabilizeTimer);
+  state.sttStabilizeTimer = setTimeout(() => {
+    const latest = streamStates.get(trackKey);
+    if (latest) {
+      latest.sttStabilizeTimer = null;
+    }
+    console.log(`🧊 STT stabilize flush (${reason}) [${state.speaker}] — delay ${delayMs}ms`);
+    void flushTranscriptionWindow(trackKey);
+  }, Math.max(0, delayMs));
+}
+
 async function flushTranscriptionWindow(trackKey) {
   const state = streamStates.get(trackKey);
   if (!state || state.isTranscribing) return;
@@ -419,21 +752,79 @@ async function flushTranscriptionWindow(trackKey) {
   state.packetCount = 0;
 
   try {
-    const transcriptText = await transcribeTwilioMuLawChunk(audioBuffer);
-    if (transcriptText) {
+    const transcriptTextRaw = await transcribeTwilioMuLawChunk(audioBuffer);
+    if (transcriptTextRaw) {
+      logTranscriptStage("RAW", {
+        streamSid: state.streamSid,
+        trackKey,
+        speaker,
+        packetCount,
+        byteLength,
+        text: transcriptTextRaw,
+      });
+
+      const stability = shouldAcceptStableTranscript(state, transcriptTextRaw);
+      if (!stability.accepted) {
+        logTranscriptStage("DROPPED_STABLE", {
+          streamSid: state.streamSid,
+          trackKey,
+          speaker,
+          reason: stability.reason,
+          text: transcriptTextRaw,
+        });
+        return;
+      }
+
+      const correctedTranscript = applyDeterministicCorrections(transcriptTextRaw);
+      logTranscriptStage("CORRECTED", {
+        streamSid: state.streamSid,
+        trackKey,
+        speaker,
+        text: correctedTranscript,
+      });
+
+      const quality = evaluateTranscriptQuality(correctedTranscript);
+      if (!quality.accepted) {
+        logTranscriptStage("DROPPED_QUALITY", {
+          streamSid: state.streamSid,
+          trackKey,
+          speaker,
+          reason: quality.reason,
+          text: correctedTranscript,
+        });
+        return;
+      }
+
+      const aiInputText = quality.text;
+      logTranscriptStage("AI_INPUT", {
+        streamSid: state.streamSid,
+        trackKey,
+        speaker,
+        text: aiInputText,
+      });
+
+      const entityValidation = normalizeCriticalEntitiesForAi(aiInputText);
+      logTranscriptStage("ENTITY_VALIDATION", {
+        streamSid: state.streamSid,
+        trackKey,
+        speaker,
+        text: entityValidation.normalizedText,
+        entities: entityValidation.entities,
+      });
+
       const transcriptData = {
         streamSid: state.streamSid,
         trackKey,
         speaker,              // ← frontend uses this to colour-code the bubble
         packetCount,
         byteLength,
-        text: transcriptText,
+        text: aiInputText,
       };
 
       const session = getOrCreateCopilotSession(state.streamSid);
       session.conversation.push({
         speaker,
-        text: transcriptText,
+        text: aiInputText,
         timestamp: Date.now(),
       });
 
@@ -441,15 +832,23 @@ async function flushTranscriptionWindow(trackKey) {
         session.conversation = session.conversation.slice(-250);
       }
 
-      console.log(`📝 [${speaker}]:`, transcriptText);
+      console.log(`📝 [${speaker}]:`, aiInputText);
       emitToStreamAudience(state.streamSid, "transcript:chunk", transcriptData);
 
       const hint = await generateRealtimeHint({
-        latestText: transcriptText,
+        latestText: entityValidation.normalizedText,
         conversation: session.conversation,
+        entityContext: entityValidation.entities,
       });
 
       if (hint) {
+        logTranscriptStage("AI_OUTPUT", {
+          streamSid: state.streamSid,
+          trackKey,
+          speaker,
+          hint,
+        });
+
         const hintData = {
           streamSid: state.streamSid,
           speaker,
@@ -485,7 +884,8 @@ function vadFlush(trackKey, reason) {
   state.isSpeaking   = false;
 
   console.log(`🔊→🤫 VAD flush (${reason}) [${state.speaker}] — ${state.bytes} bytes buffered`);
-  void flushTranscriptionWindow(trackKey);
+  const stabilizationDelay = reason === "stream-end" ? 0 : STT_STABILIZATION_MS;
+  scheduleSttFlush(trackKey, reason, stabilizationDelay);
 }
 
 function cleanupStreamState(trackKey) {
@@ -493,6 +893,7 @@ function cleanupStreamState(trackKey) {
   if (!state) return;
   clearTimeout(state.silenceTimer);
   clearTimeout(state.maxTimer);
+  clearTimeout(state.sttStabilizeTimer);
   streamStates.delete(trackKey);
 }
 
@@ -507,7 +908,7 @@ function scheduleSessionSummary(streamSid, reason) {
   // then generate summary from the finalized conversation/hint buffers.
   setTimeout(() => {
     void emitSessionSummaryForStream(streamSid, reason);
-  }, 450);
+  }, 450 + STT_STABILIZATION_MS);
 }
 
 const AccessToken = twilio.jwt.AccessToken;
@@ -877,6 +1278,9 @@ wss.on("connection", (socket, request) => {
         state.packetCount += 1;
 
         if (rms >= SPEECH_RMS_THRESHOLD) {
+          clearTimeout(state.sttStabilizeTimer);
+          state.sttStabilizeTimer = null;
+
           if (!state.isSpeaking) {
             state.isSpeaking = true;
             console.log(`🗣️  [${speaker}] Speech start (RMS: ${rms.toFixed(0)})`);
@@ -915,7 +1319,7 @@ wss.on("connection", (socket, request) => {
           setTimeout(() => {
             cleanupStreamState(`${rawSid}-inbound`);
             cleanupStreamState(`${rawSid}-outbound`);
-          }, 100);
+          }, 100 + STT_STABILIZATION_MS);
         }
         console.log("Media stream stopped", { streamSid, mediaPacketCount });
         break;

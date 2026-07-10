@@ -24,6 +24,12 @@ const DEEPGRAM_MODEL = process.env.DEEPGRAM_MODEL?.toString().trim() || "nova-2"
 const DEEPGRAM_SMART_FORMAT = (process.env.DEEPGRAM_SMART_FORMAT || "true").toLowerCase() !== "false";
 const DEEPGRAM_PUNCTUATE = (process.env.DEEPGRAM_PUNCTUATE || "true").toLowerCase() !== "false";
 const DEEPGRAM_FALLBACK_TO_GROQ = (process.env.DEEPGRAM_FALLBACK_TO_GROQ || "true").toLowerCase() !== "false";
+const DEEPGRAM_KEYWORDS = (process.env.DEEPGRAM_KEYWORDS || "")
+  .split(",")
+  .map((keyword) => keyword.trim())
+  .filter(Boolean);
+const HALLUCINATION_WEAK_RMS_MAX = Number(process.env.HALLUCINATION_WEAK_RMS_MAX || 900);
+const HALLUCINATION_SHORT_BYTES_MAX = Number(process.env.HALLUCINATION_SHORT_BYTES_MAX || 11000);
 let hasLoggedSttConfig = false;
 
 // ── Whisper Prompt/Language Configuration ─────────────────────────────────────
@@ -35,7 +41,7 @@ const WHISPER_LANGUAGE = process.env.COPILOT_STT_LANGUAGE?.toString().trim() || 
 // ── Hallucination Filter ──────────────────────────────────────────────────────
 // Whisper hallucinates these phrases on low-quality/silent phone audio.
 // "Subtitles by the Amara.org community" is one of the most common ones.
-const HALLUCINATION_PATTERNS = [
+const HALLUCINATION_ALWAYS_PATTERNS = [
   // Transcript/subtitle service hallucinations (very common on phone audio)
   /amara\.org/i,
   /subtitles by/i,
@@ -43,9 +49,7 @@ const HALLUCINATION_PATTERNS = [
   /mooc-subtitles/i,
   /www\.[a-z0-9-]+\.[a-z]{2,}/i,      // any URL pattern
 
-  // Generic Whisper silence hallucinations
-  /^thank you\.?$/i,
-  /^thanks\.?$/i,
+  // Persistent non-speech artifacts
   /^thanks for watching\.?$/i,
   /^thank you for watching\.?$/i,
   /^please subscribe\.?$/i,
@@ -59,6 +63,11 @@ const HALLUCINATION_PATTERNS = [
 
   // Single character / punctuation only
   /^[^a-z0-9]{0,3}$/i,
+];
+
+const HALLUCINATION_WEAK_AUDIO_PATTERNS = [
+  /^thank you\.?$/i,
+  /^thanks\.?$/i,
 ];
 
 let groqClient = null;
@@ -106,8 +115,19 @@ function calculateRMS(muLawBuffer) {
 /**
  * Returns true if the text looks like a Whisper hallucination on silence.
  */
-function isHallucination(text) {
-  return HALLUCINATION_PATTERNS.some((pattern) => pattern.test(text.trim()));
+function isHallucination(text, rms, rawBytes) {
+  const trimmed = text.trim();
+
+  if (HALLUCINATION_ALWAYS_PATTERNS.some((pattern) => pattern.test(trimmed))) {
+    return true;
+  }
+
+  const isWeakChunk = rms <= HALLUCINATION_WEAK_RMS_MAX && rawBytes <= HALLUCINATION_SHORT_BYTES_MAX;
+  if (isWeakChunk && HALLUCINATION_WEAK_AUDIO_PATTERNS.some((pattern) => pattern.test(trimmed))) {
+    return true;
+  }
+
+  return false;
 }
 
 function muLawToPcm16Buffer(muLawBuffer) {
@@ -277,6 +297,10 @@ function buildDeepgramUrl() {
     query.set("language", WHISPER_LANGUAGE);
   }
 
+  for (const keyword of DEEPGRAM_KEYWORDS) {
+    query.append("keywords", keyword);
+  }
+
   return `https://api.deepgram.com/v1/listen?${query.toString()}`;
 }
 
@@ -317,6 +341,7 @@ function logSttConfigOnce() {
     language: WHISPER_LANGUAGE || "auto",
     ffmpegUpsample: ENABLE_FFMPEG_UPSAMPLE,
     deepgramFallbackToGroq: STT_PROVIDER === "deepgram" ? DEEPGRAM_FALLBACK_TO_GROQ : false,
+    deepgramKeywords: STT_PROVIDER === "deepgram" ? DEEPGRAM_KEYWORDS.length : 0,
   });
 
   hasLoggedSttConfig = true;
@@ -375,7 +400,7 @@ export async function transcribeTwilioMuLawChunk(muLawBuffer) {
   // ── Guard 3: Hallucination filter ────────────────────────────────────────
   // Whisper frequently outputs "Thank you.", "Thanks for watching." etc. on
   // near-silent audio. Drop these known false positives.
-  if (isHallucination(text)) {
+  if (isHallucination(text, rms, muLawBuffer.length)) {
     console.log(`🚫 Filtered hallucination: "${text}"`);
     return "";
   }

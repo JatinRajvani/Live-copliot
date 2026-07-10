@@ -126,29 +126,38 @@ export const initDevice = async (identity) => {
     return { ok: false, error: "missing-auth-token" };
   }
 
-  const query = identity?.trim()
-    ? `?identity=${encodeURIComponent(identity.trim().toLowerCase())}`
-    : "";
-  const res = await fetch(`${BACKEND}/token${query}`, {
-    headers: {
-      Authorization: `Bearer ${authToken}`,
-    },
-  });
+  const fetchTokenData = async () => {
+    const query = identity?.trim()
+      ? `?identity=${encodeURIComponent(identity.trim().toLowerCase())}`
+      : "";
+    const res = await fetch(`${BACKEND}/token${query}`, {
+      headers: {
+        Authorization: `Bearer ${authToken}`,
+      },
+    });
 
-  if (!res.ok) {
-    let payload;
-    try {
-      payload = await res.json();
-    } catch {
-      payload = null;
+    if (!res.ok) {
+      let payload;
+      try {
+        payload = await res.json();
+      } catch {
+        payload = null;
+      }
+      throw new Error(payload?.error || res.statusText);
     }
-    console.error("Failed to fetch token", payload?.error || res.statusText);
-    return { ok: false, error: payload?.error || "token-fetch-failed" };
+
+    return await res.json();
+  };
+
+  let initialData;
+  try {
+    initialData = await fetchTokenData();
+  } catch (error) {
+    console.error("Failed to fetch token", error.message);
+    return { ok: false, error: error.message || "token-fetch-failed" };
   }
 
-  const data = await res.json();
-  const resolvedIdentity = data?.identity?.toString().trim().toLowerCase();
-
+  const resolvedIdentity = initialData?.identity?.toString().trim().toLowerCase();
   if (!resolvedIdentity) {
     console.error("Token API did not return resolved identity");
     return { ok: false, error: "missing-identity" };
@@ -158,7 +167,9 @@ export const initDevice = async (identity) => {
     await destroyTwilio();
   }
 
-  device = new Device(data.token);
+  device = new Device(initialData.token, {
+    tokenRefreshMs: 30000, // Trigger tokenWillExpire 30 seconds before expiration
+  });
 
   device.on("registered", () => {
     console.log("Device registered");
@@ -180,6 +191,19 @@ export const initDevice = async (identity) => {
   device.on("error", (err) => {
     console.error("Twilio device error:", err);
     emit("device:error", err);
+  });
+
+  device.on("tokenWillExpire", async () => {
+    console.log("Twilio token is expiring soon. Fetching a new one...");
+    try {
+      const freshData = await fetchTokenData();
+      if (freshData?.token) {
+        device.updateToken(freshData.token);
+        console.log("Twilio token successfully refreshed.");
+      }
+    } catch (err) {
+      console.error("Failed to refresh Twilio token:", err);
+    }
   });
 
   await device.register();
